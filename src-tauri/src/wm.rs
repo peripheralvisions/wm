@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallNextHookEx, DeferWindowPos, DispatchMessageW, EndDeferWindowPos,
     EnumWindows, GetClassNameW, GetForegroundWindow, GetMessageW, GetParent, GetWindowInfo,
@@ -23,9 +23,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOCOPYBITS,
     SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WH_MOUSE_LL, WINDOWINFO, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
+    WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
     WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP, WS_THICKFRAME,
 };
+
+
+#[derive(Clone, Debug)]
+pub enum WmAction {
+    MoveWindow(i32),
+    ResizeWindow(&'static str),
+}
+
+pub static ACTIONS: Lazy<Mutex<Vec<WmAction>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WmConfig {
@@ -437,7 +446,53 @@ impl WmState {
             acc_x += w.width + self.config.gap;
         }
     }
+
+    fn move_active_window(&mut self, direction: i32) {
+        unsafe {
+            let fw = GetForegroundWindow();
+            let shwnd = SendHwnd::new(fw);
+            if let Some(pos) = self.windows.iter().position(|w| w.hwnd == shwnd) {
+                let new_pos = (pos as i32 + direction).clamp(0, (self.windows.len().saturating_sub(1)) as i32) as usize;
+                if new_pos != pos {
+                    let w = self.windows.remove(pos);
+                    self.windows.insert(new_pos, w);
+                    self.apply_layout(true);
+                    self.focus_window(fw);
+                }
+            }
+        }
+    }
+
+    fn resize_active_window(&mut self, size_type: &str) {
+        unsafe {
+            let fw = GetForegroundWindow();
+            let shwnd = SendHwnd::new(fw);
+            if let Some(w) = self.windows.iter_mut().find(|win| win.hwnd == shwnd) {
+                let screen_w = self.screen_width as f32;
+                if size_type == "full" {
+                    w.width = screen_w as i32;
+                } else if size_type == "cycle" {
+                    let options = [0.20, 0.25, 0.33, 0.50, 0.60, 0.80, 1.0];
+                    let current_pct = w.width as f32 / screen_w;
+                    let mut closest_idx = 0;
+                    let mut min_diff = f32::MAX;
+                    for (i, &opt) in options.iter().enumerate() {
+                        let diff = (opt - current_pct).abs();
+                        if diff < min_diff {
+                            min_diff = diff;
+                            closest_idx = i;
+                        }
+                    }
+                    let next_idx = (closest_idx + 1) % options.len();
+                    w.width = (screen_w * options[next_idx]).round() as i32;
+                }
+            }
+            self.apply_layout(true);
+            self.focus_window(fw);
+        }
+    }
 }
+
 
 pub fn get_config() -> WmConfig {
     if let Ok(state) = STATE.lock() {
@@ -627,19 +682,79 @@ unsafe extern "system" fn mouse_hook_proc(
 ) -> LRESULT {
     if ncode >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
         let alt_state = GetAsyncKeyState(VK_MENU.0 as i32);
-        if (alt_state as u16 & 0x8000) != 0 {
+        let shift_state = GetAsyncKeyState(VK_SHIFT.0 as i32);
+        let is_alt = (alt_state as u16 & 0x8000) != 0;
+        let is_shift = (shift_state as u16 & 0x8000) != 0;
+
+        if is_alt {
             let msll = *(lparam.0 as *const MSLLHOOKSTRUCT);
             let mouse_data = msll.mouseData;
             let delta = (mouse_data >> 16) as i16;
 
-            SCROLL_ACCUM.fetch_add(delta as i32, Ordering::Relaxed);
-            WAKE_CONDVAR.notify_one();
+            if is_shift {
+                // scroll down (delta < 0) = move left/back (-1)
+                // scroll up (delta > 0) = move right/forward (+1)
+                let dir = if delta > 0 { 1 } else { -1 };
+                if let Ok(mut lock) = ACTIONS.lock() {
+                    lock.push(WmAction::MoveWindow(dir));
+                }
+                WAKE_CONDVAR.notify_one();
+            } else {
+                SCROLL_ACCUM.fetch_add(delta as i32, Ordering::Relaxed);
+                WAKE_CONDVAR.notify_one();
+            }
 
             return LRESULT(1);
         }
     }
     CallNextHookEx(None, ncode, wparam, lparam)
 }
+
+unsafe extern "system" fn keyboard_hook_proc(
+    ncode: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if ncode >= 0 && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN) {
+        let alt_state = GetAsyncKeyState(VK_MENU.0 as i32);
+        let is_alt = (alt_state as u16 & 0x8000) != 0;
+
+        if is_alt {
+            let kbd = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+            let vk = kbd.vkCode;
+            let mut handled = false;
+
+            if vk == VK_LEFT.0 as u32 {
+                if let Ok(mut lock) = ACTIONS.lock() {
+                    lock.push(WmAction::MoveWindow(-1));
+                }
+                handled = true;
+            } else if vk == VK_RIGHT.0 as u32 {
+                if let Ok(mut lock) = ACTIONS.lock() {
+                    lock.push(WmAction::MoveWindow(1));
+                }
+                handled = true;
+            } else if vk == 0x53 { // 'S'
+                if let Ok(mut lock) = ACTIONS.lock() {
+                    lock.push(WmAction::ResizeWindow("cycle"));
+                }
+                handled = true;
+            } else if vk == 0x46 { // 'F'
+                if let Ok(mut lock) = ACTIONS.lock() {
+                    lock.push(WmAction::ResizeWindow("full"));
+                }
+                handled = true;
+            }
+
+            if handled {
+                WAKE_CONDVAR.notify_one();
+                return LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(None, ncode, wparam, lparam)
+}
+
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
     if is_manageable(hwnd) {
@@ -669,6 +784,17 @@ pub fn start_wm() {
             let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
 
             if let Ok(mut state) = STATE.lock() {
+                let mut actions = Vec::new();
+                if let Ok(mut lock) = ACTIONS.lock() {
+                    std::mem::swap(&mut actions, &mut *lock);
+                }
+                for action in actions {
+                    match action {
+                        WmAction::MoveWindow(dir) => state.move_active_window(dir),
+                        WmAction::ResizeWindow(t) => state.resize_active_window(t),
+                    }
+                }
+
                 // Process any accumulated scroll wheel inputs
                 let delta = SCROLL_ACCUM.swap(0, Ordering::Relaxed);
                 if delta != 0 {
@@ -703,9 +829,10 @@ pub fn start_wm() {
             }
 
             if !is_animating {
-                // Wait for next scroll input with zero-latency wakeup via Condvar
+                // Wait for next input with zero-latency wakeup via Condvar
                 if let Ok(lock) = WAKE_MUTEX.lock() {
-                    if SCROLL_ACCUM.load(Ordering::Relaxed) == 0 {
+                    let actions_empty = ACTIONS.lock().map(|a| a.is_empty()).unwrap_or(true);
+                    if SCROLL_ACCUM.load(Ordering::Relaxed) == 0 && actions_empty {
                         let _ = WAKE_CONDVAR.wait_timeout(lock, Duration::from_millis(50));
                     }
                 }
@@ -720,7 +847,7 @@ pub fn start_wm() {
         }
     });
 
-    // 2. Dedicated Mouse Hook Thread (Isolated from WinEvents and Layout to prevent timeouts)
+    // 2. Dedicated Input Hook Thread (Isolated from WinEvents and Layout to prevent timeouts)
     thread::spawn(move || {
         unsafe {
             let hinstance = match GetModuleHandleW(None) {
@@ -730,6 +857,9 @@ pub fn start_wm() {
 
             let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(hinstance), 0)
                 .expect("Failed to set low-level mouse hook");
+            
+            let kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(hinstance), 0)
+                .expect("Failed to set low-level keyboard hook");
 
             let mut msg: MSG = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -738,6 +868,7 @@ pub fn start_wm() {
             }
 
             let _ = UnhookWindowsHookEx(mouse_hook);
+            let _ = UnhookWindowsHookEx(kbd_hook);
         }
     });
 
