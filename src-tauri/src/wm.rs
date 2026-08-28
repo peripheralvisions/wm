@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED,
-    DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
@@ -148,6 +148,18 @@ impl WmState {
             return false;
         }
 
+        // Disable DWM animations (like smooth resize/minimize) for this window
+        // to ensure keybind resizes and tiling operations update visually instantly.
+        unsafe {
+            let disable: windows::core::BOOL = true.into();
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                &disable as *const _ as *const _,
+                std::mem::size_of::<windows::core::BOOL>() as u32,
+            );
+        }
+
         let width = if self.config.column_sizing_mode == "percent" {
             (self.screen_width as f32 * (self.config.column_sizing_value / 100.0)).round() as i32
         } else {
@@ -265,15 +277,13 @@ impl WmState {
         unsafe {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
-            let base_flags = SWP_NOZORDER
-                | SWP_NOACTIVATE
-                | SWP_NOSENDCHANGING
-                | SWP_ASYNCWINDOWPOS; // Critical for not blocking the animation thread
-
             let flags = if size_changed {
-                base_flags | SWP_NOCOPYBITS
+                // For resizing, we want synchronous updates so windows repaint immediately.
+                // We omit SWP_ASYNCWINDOWPOS and SWP_NOSENDCHANGING.
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS
             } else {
-                base_flags | SWP_NOSIZE
+                // For scrolling, we translate asynchronously to prevent blocking our 144Hz loop.
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOSIZE
             };
 
             // Only use DeferWindowPos for resizing, as it blocks scrolling animation even with SWP_ASYNCWINDOWPOS
@@ -530,10 +540,11 @@ static WAKE_CONDVAR: Lazy<Condvar> = Lazy::new(Condvar::new);
 // Evicted when the window is destroyed.
 static REJECTED_CACHE: Lazy<Mutex<HashSet<isize>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
-fn is_manageable(hwnd: HWND) -> bool {
+// Returns (is_manageable, is_permanently_rejected)
+fn is_manageable(hwnd: HWND) -> (bool, bool) {
     unsafe {
-        if hwnd.0.is_null() || !IsWindowVisible(hwnd).as_bool() {
-            return false;
+        if hwnd.0.is_null() {
+            return (false, true);
         }
 
         let mut cloaked = 0u32;
@@ -546,7 +557,8 @@ fn is_manageable(hwnd: HWND) -> bool {
         .is_ok()
         {
             if cloaked != 0 {
-                return false;
+                // Cloaked state is dynamic, do not permanently reject
+                return (false, false);
             }
         }
 
@@ -554,14 +566,11 @@ fn is_manageable(hwnd: HWND) -> bool {
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
         if style & WS_CHILD.0 != 0 {
-            return false;
-        }
-        if style & WS_MINIMIZE.0 != 0 {
-            return false;
+            return (false, true);
         }
 
         if (ex_style & WS_EX_TOOLWINDOW.0 != 0) && (ex_style & WS_EX_APPWINDOW.0 == 0) {
-            return false;
+            return (false, true);
         }
 
         if let Ok(parent) = GetParent(hwnd) {
@@ -569,7 +578,7 @@ fn is_manageable(hwnd: HWND) -> bool {
                 && parent.0 != std::ptr::null_mut()
                 && (ex_style & WS_EX_APPWINDOW.0 == 0)
             {
-                return false;
+                return (false, true);
             }
         }
 
@@ -577,13 +586,13 @@ fn is_manageable(hwnd: HWND) -> bool {
             && (style & (WS_THICKFRAME.0 | WS_CAPTION.0) == 0)
             && (ex_style & WS_EX_APPWINDOW.0 == 0)
         {
-            return false;
+            return (false, true);
         }
 
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid == 0 || pid == std::process::id() {
-            return false;
+            return (false, true);
         }
 
         let mut buf = [0u16; 256];
@@ -603,10 +612,19 @@ fn is_manageable(hwnd: HWND) -> bool {
         ];
 
         if ignored_classes.contains(&class_name.as_str()) {
-            return false;
+            return (false, true);
+        }
+
+        // Dynamic checks evaluated last
+        if !IsWindowVisible(hwnd).as_bool() {
+            return (false, false);
+        }
+
+        if style & WS_MINIMIZE.0 != 0 {
+            return (false, false);
         }
     }
-    true
+    (true, false)
 }
 
 unsafe extern "system" fn win_event_hook(
@@ -676,9 +694,12 @@ unsafe extern "system" fn win_event_hook(
         }
     }
 
-    if !is_manageable(hwnd) {
-        if let Ok(mut cache) = REJECTED_CACHE.lock() {
-            cache.insert(hwnd_key);
+    let (manageable, permanent_reject) = is_manageable(hwnd);
+    if !manageable {
+        if permanent_reject {
+            if let Ok(mut cache) = REJECTED_CACHE.lock() {
+                cache.insert(hwnd_key);
+            }
         }
         return;
     }
@@ -802,7 +823,7 @@ unsafe extern "system" fn keyboard_hook_proc(
 
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
-    if is_manageable(hwnd) {
+    if is_manageable(hwnd).0 {
         if let Ok(mut state) = STATE.lock() {
             state.add_window_internal(hwnd);
         }
@@ -911,17 +932,24 @@ pub fn start_wm() {
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     let diff = state.target_offset_x - state.current_offset_x;
+                    let mut needs_scroll_update = false;
+
                     if diff.abs() > 0.5 {
                         is_animating = true;
                         factor_used = 1.0 - (-22.0 * dt).exp();
                         state.current_offset_x += diff * factor_used;
-                        state.apply_scroll_frame();
+                        needs_scroll_update = true;
                     } else if state.current_offset_x != state.target_offset_x {
                         state.current_offset_x = state.target_offset_x;
-                        state.apply_scroll_frame();
-                    } else if dirty {
-                        // No animation in progress, but layout changed (window add/remove/resize)
+                        needs_scroll_update = true;
+                    }
+
+                    if dirty {
+                        // Priority: if layout changed, we MUST apply layout and pass size_changed.
+                        // This handles the resize immediately without being swallowed by the animation frame.
                         state.apply_layout(size_changed);
+                    } else if needs_scroll_update {
+                        state.apply_scroll_frame();
                     }
                 } else if dirty {
                     state.apply_layout(size_changed);
