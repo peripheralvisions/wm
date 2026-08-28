@@ -11,6 +11,7 @@ use windows::Win32::Graphics::Dwm::{
     DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -772,7 +773,14 @@ pub fn start_wm() {
 
     // 1. High-refresh rate VSync-locked physics loop
     thread::spawn(move || {
+        // TIME_CRITICAL ensures DwmFlush wakes on every VBlank, not every other one.
+        // Without this, Windows schedules the thread late and it misses the VSync edge.
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
         let mut last_tick = Instant::now();
+        // Pre-allocate action buffer to avoid per-frame allocation during animation
+        let mut actions = Vec::with_capacity(8);
 
         loop {
             let mut is_animating = false;
@@ -782,13 +790,14 @@ pub fn start_wm() {
 
             let now = Instant::now();
             let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
+            last_tick = now;
 
             if let Ok(mut state) = STATE.lock() {
-                let mut actions = Vec::new();
+                actions.clear();
                 if let Ok(mut lock) = ACTIONS.lock() {
                     std::mem::swap(&mut actions, &mut *lock);
                 }
-                for action in actions {
+                for action in actions.drain(..) {
                     match action {
                         WmAction::MoveWindow(dir) => state.move_active_window(dir),
                         WmAction::ResizeWindow(t) => state.resize_active_window(t),
@@ -828,8 +837,17 @@ pub fn start_wm() {
                 }
             }
 
-            if !is_animating {
-                // Wait for next input with zero-latency wakeup via Condvar
+            if is_animating {
+                // Block until the compositor presents the current frame, then
+                // immediately wake to compute the next one. This locks the loop
+                // to the display's exact refresh rate (60/144/240 Hz) with zero
+                // busy-waiting — DwmFlush sleeps the thread until VBlank.
+                unsafe {
+                    let _ = DwmFlush();
+                }
+            } else {
+                // Nothing to animate: sleep until woken by input or 50 ms timeout.
+                // Reset last_tick after sleeping so dt doesn't include sleep time.
                 if let Ok(lock) = WAKE_MUTEX.lock() {
                     let actions_empty = ACTIONS.lock().map(|a| a.is_empty()).unwrap_or(true);
                     if SCROLL_ACCUM.load(Ordering::Relaxed) == 0 && actions_empty {
@@ -837,12 +855,6 @@ pub fn start_wm() {
                     }
                 }
                 last_tick = Instant::now();
-            } else {
-                last_tick = now;
-                // Sync with DWM compositor VSync (adapts to 60Hz, 144Hz, 240Hz, etc.)
-                unsafe {
-                    let _ = DwmFlush();
-                }
             }
         }
     });
