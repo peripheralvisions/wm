@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
@@ -8,8 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+    DwmGetWindowAttribute, DWMWA_CLOAKED,
+    DWMWA_EXTENDED_FRAME_BOUNDS,
 };
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
+    MonitorFromWindow, GetMonitorInfoW, MONITORINFOEXW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+};
+use windows::Win32::Media::timeBeginPeriod;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -17,13 +25,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallNextHookEx, DeferWindowPos, DispatchMessageW, EndDeferWindowPos,
     EnumWindows, GetClassNameW, GetForegroundWindow, GetMessageW, GetParent, GetWindowInfo,
-    GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowPos,
+    GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos,
     SetWindowsHookExW, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
     WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP, WS_THICKFRAME,
 };
@@ -95,7 +103,6 @@ struct WmState {
     screen_width: i32,
     screen_height: i32,
     config: WmConfig,
-    is_updating_layout: bool,
     resizing_hwnd: Option<SendHwnd>,
     last_rendered_int_offset: i32,
 }
@@ -111,7 +118,6 @@ impl WmState {
             screen_width: 1920,
             screen_height: 1040,
             config: WmConfig::default(),
-            is_updating_layout: false,
             resizing_hwnd: None,
             last_rendered_int_offset: i32::MIN,
         }
@@ -186,33 +192,14 @@ impl WmState {
         true
     }
 
-    fn add_window(&mut self, hwnd: HWND) {
-        if self.add_window_internal(hwnd) {
-            self.apply_layout(true);
-        }
-    }
-
-    fn remove_window(&mut self, hwnd: HWND) {
+    // Returns true if the window was present and removed.
+    fn remove_window_internal(&mut self, hwnd: HWND) -> Option<usize> {
         let shwnd = SendHwnd::new(hwnd);
         if let Some(pos) = self.windows.iter().position(|w| w.hwnd == shwnd) {
             self.windows.remove(pos);
-
-            if !self.windows.is_empty() {
-                let next_idx = if pos < self.windows.len() {
-                    pos
-                } else {
-                    self.windows.len() - 1
-                };
-                let next_hwnd = self.windows[next_idx].hwnd.get();
-                self.focus_window(next_hwnd);
-
-                unsafe {
-                    let _ = SetForegroundWindow(next_hwnd);
-                }
-            } else {
-                self.apply_layout(true);
-            }
+            return Some(pos);
         }
+        None
     }
 
     fn max_offset(&self) -> i32 {
@@ -257,10 +244,9 @@ impl WmState {
     /// Layout repositioning and sizing.
     /// Uses BeginDeferWindowPos/EndDeferWindowPos for atomic multi-window update.
     fn apply_layout(&mut self, size_changed: bool) {
-        if !self.config.enabled || self.is_updating_layout {
+        if !self.config.enabled {
             return;
         }
-        self.is_updating_layout = true;
 
         let max_off = self.max_offset() as f32;
         self.target_offset_x = self.target_offset_x.clamp(0.0, max_off);
@@ -270,7 +256,6 @@ impl WmState {
         self.current_offset_x = self.current_offset_x.clamp(0.0, max_off);
 
         if self.windows.is_empty() {
-            self.is_updating_layout = false;
             return;
         }
 
@@ -279,17 +264,11 @@ impl WmState {
 
         unsafe {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
-            let window_count = self.windows.len() as i32;
-
-            let hdwp_res = BeginDeferWindowPos(window_count);
-            let mut hdwp = match hdwp_res {
-                Ok(h) if !h.is_invalid() => Some(h),
-                _ => None,
-            };
 
             let base_flags = SWP_NOZORDER
                 | SWP_NOACTIVATE
-                | SWP_NOSENDCHANGING;
+                | SWP_NOSENDCHANGING
+                | SWP_ASYNCWINDOWPOS; // Critical for not blocking the animation thread
 
             let flags = if size_changed {
                 base_flags | SWP_NOCOPYBITS
@@ -297,10 +276,22 @@ impl WmState {
                 base_flags | SWP_NOSIZE
             };
 
+            // Only use DeferWindowPos for resizing, as it blocks scrolling animation even with SWP_ASYNCWINDOWPOS
+            let use_defer = size_changed;
+            let mut hdwp = if use_defer {
+                let window_count = self.windows.len() as i32;
+                match BeginDeferWindowPos(window_count) {
+                    Ok(h) if !h.is_invalid() => Some(h),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             for w in &self.windows {
                 let hwnd = w.hwnd.get();
 
-                // Skip repositioning a window while the user is actively dragging its borders
+                // Skip a window while the user is actively dragging its borders
                 if let Some(ref resizing) = self.resizing_hwnd {
                     if resizing.0 == w.hwnd.0 {
                         current_x += w.width + self.config.gap;
@@ -360,8 +351,6 @@ impl WmState {
                 let _ = EndDeferWindowPos(h);
             }
         }
-
-        self.is_updating_layout = false;
     }
 
     /// Fast translation-only update for smooth scrolling frames.
@@ -417,11 +406,11 @@ impl WmState {
 
         if !self.config.smooth_scrolling {
             self.current_offset_x = self.target_offset_x;
-            self.apply_layout(false);
         }
     }
 
-    fn focus_window(&mut self, hwnd: HWND) {
+    // Updates target_offset_x to center the given window. Does not call apply_layout.
+    fn focus_window_offset(&mut self, hwnd: HWND) {
         if !self.config.enabled {
             return;
         }
@@ -441,7 +430,6 @@ impl WmState {
                 if !self.config.smooth_scrolling {
                     self.current_offset_x = self.target_offset_x;
                 }
-                self.apply_layout(false);
                 break;
             }
             acc_x += w.width + self.config.gap;
@@ -457,8 +445,7 @@ impl WmState {
                 if new_pos != pos {
                     let w = self.windows.remove(pos);
                     self.windows.insert(new_pos, w);
-                    self.apply_layout(true);
-                    self.focus_window(fw);
+                    self.focus_window_offset(fw);
                 }
             }
         }
@@ -488,8 +475,7 @@ impl WmState {
                     w.width = (screen_w * options[next_idx]).round() as i32;
                 }
             }
-            self.apply_layout(true);
-            self.focus_window(fw);
+            self.focus_window_offset(fw);
         }
     }
 }
@@ -506,8 +492,10 @@ pub fn get_config() -> WmConfig {
 pub fn set_config(config: WmConfig) {
     if let Ok(mut state) = STATE.lock() {
         state.config = config;
-        state.apply_layout(true);
     }
+    LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+    LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+    WAKE_CONDVAR.notify_one();
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -526,9 +514,21 @@ static STATE: Lazy<Mutex<WmState>> = Lazy::new(|| Mutex::new(WmState::new()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static SCROLL_ACCUM: AtomicI32 = AtomicI32::new(0);
 
+// Dirty flags: set by hook threads, consumed by the animation loop.
+// This ensures layout passes only happen at the animation loop's cadence,
+// coalescing any burst of WinEvents (e.g. browser opening dozens of sub-windows)
+// into a single layout pass per frame.
+static LAYOUT_DIRTY: AtomicBool = AtomicBool::new(false);
+static LAYOUT_SIZE_CHANGED: AtomicBool = AtomicBool::new(false);
+
 // Zero-overhead condition variable for waking the physics thread immediately
 static WAKE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static WAKE_CONDVAR: Lazy<Condvar> = Lazy::new(Condvar::new);
+
+// Cache of HWNDs that failed is_manageable() — avoids re-running the full check
+// (multiple Win32 API calls) for the same non-manageable window on every event.
+// Evicted when the window is destroyed.
+static REJECTED_CACHE: Lazy<Mutex<HashSet<isize>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 fn is_manageable(hwnd: HWND) -> bool {
     unsafe {
@@ -622,12 +622,27 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    if event == EVENT_OBJECT_HIDE
-        || event == EVENT_OBJECT_DESTROY
-        || event == EVENT_SYSTEM_MINIMIZESTART
-    {
+    if event == EVENT_OBJECT_DESTROY {
+        // Evict from rejected cache so it can be re-evaluated if the handle is reused.
+        if let Ok(mut cache) = REJECTED_CACHE.lock() {
+            cache.remove(&(hwnd.0 as isize));
+        }
         if let Ok(mut state) = STATE.lock() {
-            state.remove_window(hwnd);
+            state.remove_window_internal(hwnd);
+        }
+        LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+        LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+        WAKE_CONDVAR.notify_one();
+        return;
+    }
+
+    if event == EVENT_OBJECT_HIDE || event == EVENT_SYSTEM_MINIMIZESTART {
+        if let Ok(mut state) = STATE.lock() {
+            if state.remove_window_internal(hwnd).is_some() {
+                LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+                LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                WAKE_CONDVAR.notify_one();
+            }
         }
         return;
     }
@@ -644,31 +659,60 @@ unsafe extern "system" fn win_event_hook(
     if event == EVENT_SYSTEM_MOVESIZEEND {
         if let Ok(mut state) = STATE.lock() {
             state.resizing_hwnd = None;
-            if state.update_window_size(hwnd) {
-                state.apply_layout(true);
-            }
+            state.update_window_size(hwnd);
         }
+        LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+        LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+        WAKE_CONDVAR.notify_one();
         return;
     }
 
+    // Check the rejected cache first to avoid redundant Win32 calls for known
+    // non-manageable windows (browser internal sub-windows fire many events).
+    let hwnd_key = hwnd.0 as isize;
+    if let Ok(cache) = REJECTED_CACHE.lock() {
+        if cache.contains(&hwnd_key) {
+            return;
+        }
+    }
+
     if !is_manageable(hwnd) {
+        if let Ok(mut cache) = REJECTED_CACHE.lock() {
+            cache.insert(hwnd_key);
+        }
         return;
     }
 
     match event {
         EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE | EVENT_SYSTEM_MINIMIZEEND => {
-            if let Ok(mut state) = STATE.lock() {
-                state.add_window(hwnd);
-                if GetForegroundWindow() == hwnd {
-                    state.focus_window(hwnd);
+            let added = if let Ok(mut state) = STATE.lock() {
+                state.add_window_internal(hwnd)
+            } else {
+                false
+            };
+            if added {
+                // Check foreground outside the STATE lock to avoid deadlock
+                let is_fg = unsafe { GetForegroundWindow() == hwnd };
+                if is_fg {
+                    if let Ok(mut state) = STATE.lock() {
+                        state.focus_window_offset(hwnd);
+                    }
                 }
+                LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+                LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                WAKE_CONDVAR.notify_one();
             }
         }
         EVENT_SYSTEM_FOREGROUND => {
             if let Ok(mut state) = STATE.lock() {
-                state.add_window(hwnd);
-                state.focus_window(hwnd);
+                let added = state.add_window_internal(hwnd);
+                state.focus_window_offset(hwnd);
+                if added {
+                    LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                }
             }
+            LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+            WAKE_CONDVAR.notify_one();
         }
         _ => {}
     }
@@ -766,21 +810,64 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::c
     true.into()
 }
 
+fn get_refresh_rate(hwnd: Option<HWND>) -> u32 {
+    unsafe {
+        let hmonitor = if let Some(h) = hwnd {
+            MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY)
+        } else {
+            MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY)
+        };
+
+        if !hmonitor.is_invalid() {
+            let mut monitor_info = MONITORINFOEXW::default();
+            monitor_info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+            let lpmi = &mut monitor_info as *mut MONITORINFOEXW as *mut MONITORINFO;
+            if GetMonitorInfoW(hmonitor, lpmi).as_bool() {
+                let mut devmode = DEVMODEW::default();
+                devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+                let device_name = windows::core::PCWSTR::from_raw(monitor_info.szDevice.as_ptr());
+                if EnumDisplaySettingsW(device_name, ENUM_CURRENT_SETTINGS, &mut devmode).as_bool() {
+                    if devmode.dmDisplayFrequency > 0 {
+                        return devmode.dmDisplayFrequency;
+                    }
+                }
+            }
+        }
+
+        // Fallback to primary display using None
+        let mut devmode = DEVMODEW::default();
+        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut devmode).as_bool() {
+            if devmode.dmDisplayFrequency > 0 {
+                return devmode.dmDisplayFrequency;
+            }
+        }
+    }
+    60 // Safe fallback
+}
+
 pub fn start_wm() {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
 
-    // 1. High-refresh rate VSync-locked physics loop
+    // 1. High-precision physics/animation loop paced directly by the hardware refresh rate.
     thread::spawn(move || {
-        // TIME_CRITICAL ensures DwmFlush wakes on every VBlank, not every other one.
-        // Without this, Windows schedules the thread late and it misses the VSync edge.
         unsafe {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            let _ = timeBeginPeriod(1);
         }
         let mut last_tick = Instant::now();
-        // Pre-allocate action buffer to avoid per-frame allocation during animation
         let mut actions = Vec::with_capacity(8);
+
+        // Cache QPC frequency (constant for the life of the process)
+        let qpc_freq: u64 = unsafe {
+            let mut freq = 0i64;
+            let _ = QueryPerformanceFrequency(&mut freq);
+            freq as u64
+        };
+        let mut next_target_qpc = 0u64;
+        let mut target_period = 0u64;
 
         loop {
             let mut is_animating = false;
@@ -799,16 +886,28 @@ pub fn start_wm() {
                 }
                 for action in actions.drain(..) {
                     match action {
-                        WmAction::MoveWindow(dir) => state.move_active_window(dir),
-                        WmAction::ResizeWindow(t) => state.resize_active_window(t),
+                        WmAction::MoveWindow(dir) => {
+                            state.move_active_window(dir);
+                            LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+                            LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                        }
+                        WmAction::ResizeWindow(t) => {
+                            state.resize_active_window(t);
+                            LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+                            LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                        }
                     }
                 }
 
-                // Process any accumulated scroll wheel inputs
                 let delta = SCROLL_ACCUM.swap(0, Ordering::Relaxed);
                 if delta != 0 {
                     state.scroll(delta);
+                    LAYOUT_DIRTY.store(true, Ordering::Relaxed);
                 }
+
+                // Process dirty layout flag — coalesces all WinEvent-driven layout requests
+                let dirty = LAYOUT_DIRTY.swap(false, Ordering::Relaxed);
+                let size_changed = LAYOUT_SIZE_CHANGED.swap(false, Ordering::Relaxed);
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     let diff = state.target_offset_x - state.current_offset_x;
@@ -820,7 +919,12 @@ pub fn start_wm() {
                     } else if state.current_offset_x != state.target_offset_x {
                         state.current_offset_x = state.target_offset_x;
                         state.apply_scroll_frame();
+                    } else if dirty {
+                        // No animation in progress, but layout changed (window add/remove/resize)
+                        state.apply_layout(size_changed);
                     }
+                } else if dirty {
+                    state.apply_layout(size_changed);
                 }
 
                 current_offset = state.current_offset_x;
@@ -838,19 +942,61 @@ pub fn start_wm() {
             }
 
             if is_animating {
-                // Block until the compositor presents the current frame, then
-                // immediately wake to compute the next one. This locks the loop
-                // to the display's exact refresh rate (60/144/240 Hz) with zero
-                // busy-waiting — DwmFlush sleeps the thread until VBlank.
                 unsafe {
-                    let _ = DwmFlush();
+                    let mut now_qpc = 0i64;
+                    let _ = QueryPerformanceCounter(&mut now_qpc);
+                    let now_qpc = now_qpc as u64;
+
+                    if next_target_qpc == 0 {
+                        // First frame of animation: query hardware refresh rate
+                        let fw = GetForegroundWindow();
+                        let refresh_rate = get_refresh_rate(if fw.0.is_null() { None } else { Some(fw) }).max(30);
+                        target_period = qpc_freq / refresh_rate as u64;
+                        next_target_qpc = now_qpc + target_period;
+                    } else {
+                        // Advance exactly by the hardware refresh period
+                        next_target_qpc += target_period;
+                    }
+
+                    // If we fell behind by more than 2 frames, resync target to now + target_period
+                    if now_qpc > next_target_qpc + target_period * 2 {
+                        next_target_qpc = now_qpc + target_period;
+                    }
+
+                    let ticks_to_sleep = next_target_qpc.saturating_sub(now_qpc);
+                    let nanos = ticks_to_sleep
+                        .saturating_mul(1_000_000_000)
+                        .checked_div(qpc_freq)
+                        .unwrap_or(0);
+
+                    if nanos > 0 {
+                        // Sleep the bulk of the time (save CPU), stopping 1.5ms early
+                        if nanos > 1_500_000 {
+                            thread::sleep(Duration::from_nanos(nanos - 1_500_000));
+                        }
+
+                        // Spin-wait the final <1.5ms for perfect microsecond pacing
+                        loop {
+                            let mut current = 0i64;
+                            let _ = QueryPerformanceCounter(&mut current);
+                            if (current as u64) >= next_target_qpc {
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
                 }
             } else {
+                next_target_qpc = 0; // Reset metronome when animation stops
+
                 // Nothing to animate: sleep until woken by input or 50 ms timeout.
                 // Reset last_tick after sleeping so dt doesn't include sleep time.
                 if let Ok(lock) = WAKE_MUTEX.lock() {
                     let actions_empty = ACTIONS.lock().map(|a| a.is_empty()).unwrap_or(true);
-                    if SCROLL_ACCUM.load(Ordering::Relaxed) == 0 && actions_empty {
+                    if SCROLL_ACCUM.load(Ordering::Relaxed) == 0
+                        && actions_empty
+                        && !LAYOUT_DIRTY.load(Ordering::Relaxed)
+                    {
                         let _ = WAKE_CONDVAR.wait_timeout(lock, Duration::from_millis(50));
                     }
                 }
@@ -869,7 +1015,7 @@ pub fn start_wm() {
 
             let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(hinstance), 0)
                 .expect("Failed to set low-level mouse hook");
-            
+
             let kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), Some(hinstance), 0)
                 .expect("Failed to set low-level keyboard hook");
 
@@ -892,9 +1038,9 @@ pub fn start_wm() {
 
         unsafe {
             let _ = EnumWindows(Some(enum_windows_proc), LPARAM(0));
-            if let Ok(mut state) = STATE.lock() {
-                state.apply_layout(true);
-            }
+            LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+            LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+            WAKE_CONDVAR.notify_one();
 
             let win_hook_create_destroy = SetWinEventHook(
                 EVENT_OBJECT_SHOW,
