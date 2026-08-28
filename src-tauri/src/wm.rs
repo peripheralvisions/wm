@@ -1,26 +1,30 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
-use std::sync::mpsc::{channel, Sender};
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DwmFlush, DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, GetSystemMetrics, GetWindowInfo,
-    GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, EVENT_OBJECT_HIDE,
-    EVENT_OBJECT_SHOW, EVENT_OBJECT_DESTROY, EVENT_SYSTEM_MOVESIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_FOREGROUND,
-    GWL_EXSTYLE, GWL_STYLE, HHOOK, MSG,
-    MSLLHOOKSTRUCT, OBJID_WINDOW, SM_CXSCREEN, SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOZORDER,
+    BeginDeferWindowPos, CallNextHookEx, DeferWindowPos, DispatchMessageW, EndDeferWindowPos,
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetMessageW, GetParent, GetWindowInfo,
+    GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow, SetWindowPos,
+    SetWindowsHookExW, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
+    MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WH_MOUSE_LL, WINDOWINFO, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
-    WS_CHILD, WS_EX_TOOLWINDOW, WS_POPUP, WS_MINIMIZE, EnumWindows, GetClassNameW,
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos
+    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP, WS_THICKFRAME,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,33 +78,62 @@ struct ManagedWindow {
 
 struct WmState {
     windows: Vec<ManagedWindow>,
-    current_offset_x: i32,
-    target_offset_x: i32,
+    current_offset_x: f32,
+    target_offset_x: f32,
+    screen_x: i32,
+    screen_y: i32,
     screen_width: i32,
     screen_height: i32,
     config: WmConfig,
+    is_updating_layout: bool,
+    resizing_hwnd: Option<SendHwnd>,
+    last_rendered_int_offset: i32,
 }
 
 impl WmState {
     fn new() -> Self {
         Self {
             windows: Vec::new(),
-            current_offset_x: 0,
-            target_offset_x: 0,
+            current_offset_x: 0.0,
+            target_offset_x: 0.0,
+            screen_x: 0,
+            screen_y: 0,
             screen_width: 1920,
-            screen_height: 1080,
+            screen_height: 1040,
             config: WmConfig::default(),
+            is_updating_layout: false,
+            resizing_hwnd: None,
+            last_rendered_int_offset: i32::MIN,
         }
     }
 
-    fn add_window(&mut self, hwnd: HWND) {
+    fn update_work_area(&mut self) {
+        unsafe {
+            let mut work_area = RECT::default();
+            if SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut work_area as *mut _ as *mut _),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+            .is_ok()
+            {
+                self.screen_x = work_area.left;
+                self.screen_y = work_area.top;
+                self.screen_width = (work_area.right - work_area.left).max(640);
+                self.screen_height = (work_area.bottom - work_area.top).max(480);
+            }
+        }
+    }
+
+    fn add_window_internal(&mut self, hwnd: HWND) -> bool {
         let shwnd = SendHwnd::new(hwnd);
         if self.windows.iter().any(|w| w.hwnd == shwnd) {
-            return;
+            return false;
         }
 
         let width = if self.config.column_sizing_mode == "percent" {
-            (self.screen_width as f32 * (self.config.column_sizing_value / 100.0)) as i32
+            (self.screen_width as f32 * (self.config.column_sizing_value / 100.0)).round() as i32
         } else {
             self.config.column_sizing_value as i32
         };
@@ -117,7 +150,9 @@ impl WmState {
                 DWMWA_EXTENDED_FRAME_BOUNDS,
                 &mut bounds as *mut _ as *mut _,
                 std::mem::size_of::<RECT>() as u32,
-            ).is_ok() {
+            )
+            .is_ok()
+            {
                 let mut win_info = WINDOWINFO::default();
                 win_info.cbSize = std::mem::size_of::<WINDOWINFO>() as u32;
                 if GetWindowInfo(hwnd, &mut win_info).is_ok() {
@@ -137,21 +172,46 @@ impl WmState {
             border_right,
             border_bottom,
         });
-        self.apply_layout();
+
+        true
+    }
+
+    fn add_window(&mut self, hwnd: HWND) {
+        if self.add_window_internal(hwnd) {
+            self.apply_layout(true);
+        }
     }
 
     fn remove_window(&mut self, hwnd: HWND) {
         let shwnd = SendHwnd::new(hwnd);
-        self.windows.retain(|w| w.hwnd != shwnd);
-        self.apply_layout();
+        if let Some(pos) = self.windows.iter().position(|w| w.hwnd == shwnd) {
+            self.windows.remove(pos);
+
+            if !self.windows.is_empty() {
+                let next_idx = if pos < self.windows.len() {
+                    pos
+                } else {
+                    self.windows.len() - 1
+                };
+                let next_hwnd = self.windows[next_idx].hwnd.get();
+                self.focus_window(next_hwnd);
+
+                unsafe {
+                    let _ = SetForegroundWindow(next_hwnd);
+                }
+            } else {
+                self.apply_layout(true);
+            }
+        }
     }
 
     fn max_offset(&self) -> i32 {
-        let total_width = self.config.gap + self.windows.iter().map(|w| w.width + self.config.gap).sum::<i32>();
+        let total_width =
+            self.config.gap + self.windows.iter().map(|w| w.width + self.config.gap).sum::<i32>();
         std::cmp::max(0, total_width - self.screen_width)
     }
 
-    fn update_window_size(&mut self, hwnd: HWND) {
+    fn update_window_size(&mut self, hwnd: HWND) -> bool {
         let shwnd = SendHwnd::new(hwnd);
         if let Some(w) = self.windows.iter_mut().find(|w| w.hwnd == shwnd) {
             unsafe {
@@ -161,93 +221,147 @@ impl WmState {
                     DWMWA_EXTENDED_FRAME_BOUNDS,
                     &mut bounds as *mut _ as *mut _,
                     std::mem::size_of::<RECT>() as u32,
-                ).is_ok() {
+                )
+                .is_ok()
+                {
                     let new_width = bounds.right - bounds.left;
-                    if new_width > 0 {
+                    if new_width > 0 && new_width != w.width {
                         w.width = new_width;
-                    }
 
-                    let mut win_info = WINDOWINFO::default();
-                    win_info.cbSize = std::mem::size_of::<WINDOWINFO>() as u32;
-                    if GetWindowInfo(hwnd, &mut win_info).is_ok() {
-                        w.border_left = bounds.left - win_info.rcWindow.left;
-                        w.border_top = bounds.top - win_info.rcWindow.top;
-                        w.border_right = win_info.rcWindow.right - bounds.right;
-                        w.border_bottom = win_info.rcWindow.bottom - bounds.bottom;
+                        let mut win_info = WINDOWINFO::default();
+                        win_info.cbSize = std::mem::size_of::<WINDOWINFO>() as u32;
+                        if GetWindowInfo(hwnd, &mut win_info).is_ok() {
+                            w.border_left = bounds.left - win_info.rcWindow.left;
+                            w.border_top = bounds.top - win_info.rcWindow.top;
+                            w.border_right = win_info.rcWindow.right - bounds.right;
+                            w.border_bottom = win_info.rcWindow.bottom - bounds.bottom;
+                        }
+                        return true;
                     }
                 }
             }
         }
+        false
     }
 
-    fn apply_layout(&mut self) {
-        if !self.config.enabled {
+    /// Layout repositioning and sizing.
+    /// Uses BeginDeferWindowPos/EndDeferWindowPos for atomic multi-window update.
+    fn apply_layout(&mut self, size_changed: bool) {
+        if !self.config.enabled || self.is_updating_layout {
             return;
         }
-        self.target_offset_x = self.target_offset_x.clamp(0, self.max_offset());
+        self.is_updating_layout = true;
+
+        let max_off = self.max_offset() as f32;
+        self.target_offset_x = self.target_offset_x.clamp(0.0, max_off);
         if !self.config.smooth_scrolling {
             self.current_offset_x = self.target_offset_x;
         }
-        self.current_offset_x = self.current_offset_x.clamp(0, self.max_offset());
+        self.current_offset_x = self.current_offset_x.clamp(0.0, max_off);
 
         if self.windows.is_empty() {
+            self.is_updating_layout = false;
             return;
         }
 
-        unsafe {
-            let hdwp = match BeginDeferWindowPos(self.windows.len() as i32) {
-                Ok(h) if !h.is_invalid() => h,
-                _ => {
-                    // Fallback to regular SetWindowPos if DeferWindowPos fails
-                    let mut current_x = self.config.gap - self.current_offset_x;
-                    for w in &self.windows {
-                        let target_x = current_x - w.border_left;
-                        let target_y = self.config.gap - w.border_top;
-                        let target_w = w.width + w.border_left + w.border_right;
-                        let target_h = (self.screen_height - self.config.gap * 2) + w.border_top + w.border_bottom;
+        let current_offset_int = self.current_offset_x.round() as i32;
+        self.last_rendered_int_offset = current_offset_int;
 
-                        let _ = SetWindowPos(
-                            w.hwnd.get(),
-                            Some(HWND::default()),
-                            target_x,
-                            target_y,
-                            target_w,
-                            target_h,
-                            SWP_NOZORDER | SWP_NOACTIVATE,
-                        );
-                        current_x += w.width + self.config.gap;
-                    }
-                    return;
-                }
+        unsafe {
+            let mut current_x = self.screen_x + self.config.gap - current_offset_int;
+            let window_count = self.windows.len() as i32;
+
+            let hdwp_res = BeginDeferWindowPos(window_count);
+            let mut hdwp = match hdwp_res {
+                Ok(h) if !h.is_invalid() => Some(h),
+                _ => None,
             };
 
-            let mut current_hdwp = hdwp;
-            let mut current_x = self.config.gap - self.current_offset_x;
+            let base_flags = SWP_NOZORDER
+                | SWP_NOACTIVATE
+                | SWP_NOCOPYBITS
+                | SWP_NOSENDCHANGING;
+
+            let flags = if size_changed {
+                base_flags
+            } else {
+                base_flags | SWP_NOSIZE
+            };
 
             for w in &self.windows {
                 let hwnd = w.hwnd.get();
-                let target_x = current_x - w.border_left;
-                let target_y = self.config.gap - w.border_top;
-                let target_w = w.width + w.border_left + w.border_right;
-                let target_h = (self.screen_height - self.config.gap * 2) + w.border_top + w.border_bottom;
 
-                if let Ok(next_hdwp) = DeferWindowPos(
-                    current_hdwp,
-                    hwnd,
-                    Some(HWND::default()),
-                    target_x,
-                    target_y,
-                    target_w,
-                    target_h,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                ) {
-                    current_hdwp = next_hdwp;
+                // Skip repositioning a window while the user is actively dragging its borders
+                if let Some(ref resizing) = self.resizing_hwnd {
+                    if resizing.0 == w.hwnd.0 {
+                        current_x += w.width + self.config.gap;
+                        continue;
+                    }
                 }
+
+                let target_x = current_x - w.border_left;
+                let target_y = self.screen_y + self.config.gap - w.border_top;
+                let target_w = w.width + w.border_left + w.border_right;
+                let target_h = (self.screen_height - self.config.gap * 2)
+                    + w.border_top
+                    + w.border_bottom;
+
+                if let Some(h) = hdwp {
+                    match DeferWindowPos(
+                        h,
+                        hwnd,
+                        Some(HWND::default()),
+                        target_x,
+                        target_y,
+                        target_w,
+                        target_h,
+                        flags,
+                    ) {
+                        Ok(new_h) if !new_h.is_invalid() => {
+                            hdwp = Some(new_h);
+                        }
+                        _ => {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND::default()),
+                                target_x,
+                                target_y,
+                                target_w,
+                                target_h,
+                                flags,
+                            );
+                        }
+                    }
+                } else {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND::default()),
+                        target_x,
+                        target_y,
+                        target_w,
+                        target_h,
+                        flags,
+                    );
+                }
+
                 current_x += w.width + self.config.gap;
             }
 
-            let _ = EndDeferWindowPos(current_hdwp);
+            if let Some(h) = hdwp {
+                let _ = EndDeferWindowPos(h);
+            }
         }
+
+        self.is_updating_layout = false;
+    }
+
+    /// Fast translation-only update for smooth scrolling frames.
+    fn apply_scroll_frame(&mut self) {
+        let current_offset_int = self.current_offset_x.round() as i32;
+        if current_offset_int == self.last_rendered_int_offset {
+            return;
+        }
+        self.apply_layout(false);
     }
 
     fn scroll(&mut self, delta: i32) {
@@ -264,7 +378,7 @@ impl WmState {
             let mut acc_x = 0;
             for (i, w) in self.windows.iter().enumerate() {
                 let center_x = acc_x + w.width / 2;
-                let view_center = self.target_offset_x + self.screen_width / 2;
+                let view_center = self.target_offset_x as i32 + self.screen_width / 2;
                 let dist = (center_x - view_center).abs();
                 if dist < min_dist {
                     min_dist = dist;
@@ -273,27 +387,29 @@ impl WmState {
                 acc_x += w.width + self.config.gap;
             }
 
-            let target_idx = (nearest_idx as i32 + direction).clamp(0, (self.windows.len() as i32 - 1).max(0)) as usize;
+            let target_idx =
+                (nearest_idx as i32 + direction).clamp(0, (self.windows.len() as i32 - 1).max(0))
+                    as usize;
 
             let mut target_acc_x = 0;
             for (i, w) in self.windows.iter().enumerate() {
                 if i == target_idx {
                     let center_x = target_acc_x + w.width / 2;
-                    self.target_offset_x = center_x - self.screen_width / 2;
+                    self.target_offset_x = (center_x - self.screen_width / 2) as f32;
                     break;
                 }
                 target_acc_x += w.width + self.config.gap;
             }
         } else {
-            let actual_delta = if delta > 0 { self.config.scroll_speed } else { -self.config.scroll_speed };
+            let actual_delta = (delta as f32 / 120.0) * self.config.scroll_speed as f32;
             self.target_offset_x -= actual_delta;
         }
-        self.target_offset_x = self.target_offset_x.clamp(0, self.max_offset());
+        self.target_offset_x = self.target_offset_x.clamp(0.0, self.max_offset() as f32);
 
         if !self.config.smooth_scrolling {
             self.current_offset_x = self.target_offset_x;
+            self.apply_layout(false);
         }
-        // apply_layout is handled by the smooth scrolling thread or at the end of batched scroll events
     }
 
     fn focus_window(&mut self, hwnd: HWND) {
@@ -306,17 +422,17 @@ impl WmState {
             if w.hwnd == shwnd {
                 let window_left = acc_x;
                 if w.width >= self.screen_width {
-                    self.target_offset_x = window_left;
+                    self.target_offset_x = window_left as f32;
                 } else {
                     let center_x = window_left + w.width / 2;
-                    self.target_offset_x = center_x - self.screen_width / 2;
+                    self.target_offset_x = (center_x - self.screen_width / 2) as f32;
                 }
-                self.target_offset_x = self.target_offset_x.clamp(0, self.max_offset());
+                self.target_offset_x = self.target_offset_x.clamp(0.0, self.max_offset() as f32);
 
                 if !self.config.smooth_scrolling {
                     self.current_offset_x = self.target_offset_x;
                 }
-                self.apply_layout();
+                self.apply_layout(false);
                 break;
             }
             acc_x += w.width + self.config.gap;
@@ -335,39 +451,71 @@ pub fn get_config() -> WmConfig {
 pub fn set_config(config: WmConfig) {
     if let Ok(mut state) = STATE.lock() {
         state.config = config;
-        state.apply_layout();
+        state.apply_layout(true);
     }
 }
 
 static STATE: Lazy<Mutex<WmState>> = Lazy::new(|| Mutex::new(WmState::new()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
-static mut MOUSE_HOOK: HHOOK = HHOOK(std::ptr::null_mut());
-static SCROLL_TX: Lazy<Mutex<Option<Sender<i32>>>> = Lazy::new(|| Mutex::new(None));
+static SCROLL_ACCUM: AtomicI32 = AtomicI32::new(0);
+
+// Zero-overhead condition variable for waking the physics thread immediately
+static WAKE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static WAKE_CONDVAR: Lazy<Condvar> = Lazy::new(Condvar::new);
 
 fn is_manageable(hwnd: HWND) -> bool {
     unsafe {
-        if !IsWindowVisible(hwnd).as_bool() {
+        if hwnd.0.is_null() || !IsWindowVisible(hwnd).as_bool() {
             return false;
         }
+
+        let mut cloaked = 0u32;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut _,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+        {
+            if cloaked != 0 {
+                return false;
+            }
+        }
+
         let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
         if style & WS_CHILD.0 != 0 {
             return false;
         }
-        if style & WS_POPUP.0 != 0 {
-            return false;
-        }
         if style & WS_MINIMIZE.0 != 0 {
             return false;
         }
-        if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+
+        if (ex_style & WS_EX_TOOLWINDOW.0 != 0) && (ex_style & WS_EX_APPWINDOW.0 == 0) {
+            return false;
+        }
+
+        if let Ok(parent) = GetParent(hwnd) {
+            if !parent.is_invalid()
+                && parent.0 != std::ptr::null_mut()
+                && (ex_style & WS_EX_APPWINDOW.0 == 0)
+            {
+                return false;
+            }
+        }
+
+        if (style & WS_POPUP.0 != 0)
+            && (style & (WS_THICKFRAME.0 | WS_CAPTION.0) == 0)
+            && (ex_style & WS_EX_APPWINDOW.0 == 0)
+        {
             return false;
         }
 
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == 0 {
+        if pid == 0 || pid == std::process::id() {
             return false;
         }
 
@@ -380,6 +528,11 @@ fn is_manageable(hwnd: HWND) -> bool {
             "WorkerW",
             "Shell_TrayWnd",
             "Shell_SecondaryTrayWnd",
+            "Windows.UI.Core.CoreWindow",
+            "SearchHost",
+            "LockScreenBackdropWindow",
+            "ScreenClippingWindow",
+            "SystemTray_Main",
         ];
 
         if ignored_classes.contains(&class_name.as_str()) {
@@ -402,9 +555,31 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    if event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY || event == EVENT_SYSTEM_MINIMIZESTART {
+    if event == EVENT_OBJECT_HIDE
+        || event == EVENT_OBJECT_DESTROY
+        || event == EVENT_SYSTEM_MINIMIZESTART
+    {
         if let Ok(mut state) = STATE.lock() {
             state.remove_window(hwnd);
+        }
+        return;
+    }
+
+    // Capture resize start so smooth scrolling/layout won't fight the user's manual dragging
+    if event == EVENT_SYSTEM_MOVESIZESTART {
+        if let Ok(mut state) = STATE.lock() {
+            state.resizing_hwnd = Some(SendHwnd::new(hwnd));
+        }
+        return;
+    }
+
+    // Resize/move finished: update width and re-tile cleanly
+    if event == EVENT_SYSTEM_MOVESIZEEND {
+        if let Ok(mut state) = STATE.lock() {
+            state.resizing_hwnd = None;
+            if state.update_window_size(hwnd) {
+                state.apply_layout(true);
+            }
         }
         return;
     }
@@ -414,19 +589,17 @@ unsafe extern "system" fn win_event_hook(
     }
 
     match event {
-        EVENT_OBJECT_SHOW | EVENT_SYSTEM_MINIMIZEEND => {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE | EVENT_SYSTEM_MINIMIZEEND => {
             if let Ok(mut state) = STATE.lock() {
                 state.add_window(hwnd);
-            }
-        }
-        EVENT_SYSTEM_MOVESIZEEND => {
-            if let Ok(mut state) = STATE.lock() {
-                state.update_window_size(hwnd);
-                state.apply_layout();
+                if GetForegroundWindow() == hwnd {
+                    state.focus_window(hwnd);
+                }
             }
         }
         EVENT_SYSTEM_FOREGROUND => {
             if let Ok(mut state) = STATE.lock() {
+                state.add_window(hwnd);
                 state.focus_window(hwnd);
             }
         }
@@ -434,32 +607,33 @@ unsafe extern "system" fn win_event_hook(
     }
 }
 
-unsafe extern "system" fn mouse_hook_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if ncode >= 0 {
-        if wparam.0 as u32 == WM_MOUSEWHEEL {
-            let alt_state = GetAsyncKeyState(VK_MENU.0 as i32);
-            if (alt_state as u16 & 0x8000) != 0 {
-                let msll = *(lparam.0 as *const MSLLHOOKSTRUCT);
-                let mouse_data = msll.mouseData;
-                let delta = (mouse_data >> 16) as i16;
+// Dedicated, non-blocking low-level mouse hook procedure.
+// Must never perform I/O, heavy computation, or mutex locking.
+unsafe extern "system" fn mouse_hook_proc(
+    ncode: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if ncode >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
+        let alt_state = GetAsyncKeyState(VK_MENU.0 as i32);
+        if (alt_state as u16 & 0x8000) != 0 {
+            let msll = *(lparam.0 as *const MSLLHOOKSTRUCT);
+            let mouse_data = msll.mouseData;
+            let delta = (mouse_data >> 16) as i16;
 
-                // Send without blocking on the main state mutex
-                if let Ok(guard) = SCROLL_TX.lock() {
-                    if let Some(tx) = guard.as_ref() {
-                        let _ = tx.send(delta as i32);
-                    }
-                }
-                return LRESULT(1); // Consume the event
-            }
+            SCROLL_ACCUM.fetch_add(delta as i32, Ordering::Relaxed);
+            WAKE_CONDVAR.notify_one();
+
+            return LRESULT(1);
         }
     }
-    CallNextHookEx(Some(MOUSE_HOOK), ncode, wparam, lparam)
+    CallNextHookEx(None, ncode, wparam, lparam)
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
     if is_manageable(hwnd) {
         if let Ok(mut state) = STATE.lock() {
-            state.add_window(hwnd);
+            state.add_window_internal(hwnd);
         }
     }
     true.into()
@@ -470,69 +644,123 @@ pub fn start_wm() {
         return;
     }
 
-    let (tx, rx) = channel::<i32>();
-    if let Ok(mut guard) = SCROLL_TX.lock() {
-        *guard = Some(tx);
-    }
-
-    // Smooth scrolling and event processing thread
+    // 1. High-refresh rate VSync-locked physics loop
     thread::spawn(move || {
-        loop {
-            let mut processed = false;
+        let mut last_tick = Instant::now();
 
-            // Process all pending scroll events from the queue
-            while let Ok(delta) = rx.try_recv() {
+        loop {
+            // Process any accumulated scroll wheel inputs
+            let delta = SCROLL_ACCUM.swap(0, Ordering::Relaxed);
+            if delta != 0 {
                 if let Ok(mut state) = STATE.lock() {
                     state.scroll(delta);
                 }
-                processed = true;
             }
 
-            if let Ok(mut state) = STATE.lock() {
-                if state.config.smooth_scrolling && state.current_offset_x != state.target_offset_x {
-                    let diff = state.target_offset_x - state.current_offset_x;
-                    if diff.abs() <= 2 {
-                        state.current_offset_x = state.target_offset_x;
-                    } else {
-                        let step = (diff as f32 * 0.25).trunc() as i32;
-                        let step = if step == 0 { diff.signum() } else { step };
-                        state.current_offset_x += step;
-                    }
-                    state.apply_layout();
-                } else if processed && !state.config.smooth_scrolling {
-                    // Update layout once after all immediate scroll events are processed
-                    state.apply_layout();
+            // Check if animation is active
+            let mut is_animating = false;
+            if let Ok(state) = STATE.lock() {
+                if state.config.enabled && state.config.smooth_scrolling {
+                    is_animating = (state.target_offset_x - state.current_offset_x).abs() > 0.25;
                 }
             }
-            thread::sleep(std::time::Duration::from_millis(16));
+
+            if !is_animating {
+                // Settle exact target offset when near zero
+                if let Ok(mut state) = STATE.lock() {
+                    if state.config.enabled
+                        && state.config.smooth_scrolling
+                        && state.current_offset_x != state.target_offset_x
+                    {
+                        state.current_offset_x = state.target_offset_x;
+                        state.apply_scroll_frame();
+                    }
+                }
+
+                // Wait for next scroll input with zero-latency wakeup via Condvar
+                if let Ok(lock) = WAKE_MUTEX.lock() {
+                    if SCROLL_ACCUM.load(Ordering::Relaxed) == 0 {
+                        let _ = WAKE_CONDVAR.wait_timeout(lock, Duration::from_millis(50));
+                    }
+                }
+
+                last_tick = Instant::now();
+                continue;
+            }
+
+            // Calculate precise delta-time between monitor VSync frames
+            let now = Instant::now();
+            let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
+            last_tick = now;
+
+            // Frame-rate independent exponential smoothing
+            if let Ok(mut state) = STATE.lock() {
+                if state.config.smooth_scrolling {
+                    let diff = state.target_offset_x - state.current_offset_x;
+                    if diff.abs() > 0.25 {
+                        let factor = 1.0 - (-16.0 * dt).exp();
+                        state.current_offset_x += diff * factor;
+                        state.apply_scroll_frame();
+                    } else {
+                        state.current_offset_x = state.target_offset_x;
+                        state.apply_scroll_frame();
+                    }
+                }
+            }
+
+            // Sync with DWM compositor VSync (adapts to 60Hz, 144Hz, 240Hz, etc.)
+            unsafe {
+                let _ = DwmFlush();
+            }
         }
     });
 
+    // 2. Dedicated Mouse Hook Thread (Isolated from WinEvents and Layout to prevent timeouts)
     thread::spawn(move || {
         unsafe {
-            let cx = GetSystemMetrics(SM_CXSCREEN);
-            let cy = GetSystemMetrics(SM_CYSCREEN);
-            if let Ok(mut state) = STATE.lock() {
-                state.screen_width = cx;
-                state.screen_height = cy - 40; // Approx taskbar space
+            let hinstance = match GetModuleHandleW(None) {
+                Ok(h) => HINSTANCE(h.0),
+                Err(_) => HINSTANCE::default(),
+            };
+
+            let mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(hinstance), 0)
+                .expect("Failed to set low-level mouse hook");
+
+            let mut msg: MSG = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&msg);
+                let _ = DispatchMessageW(&msg);
             }
 
-            // Collect existing windows
-            let _ = EnumWindows(Some(enum_windows_proc), LPARAM(0));
+            let _ = UnhookWindowsHookEx(mouse_hook);
+        }
+    });
+
+    // 3. Dedicated Window Management and WinEvent Hook Thread
+    thread::spawn(move || {
+        if let Ok(mut state) = STATE.lock() {
+            state.update_work_area();
         }
 
         unsafe {
-            MOUSE_HOOK = SetWindowsHookExW(
-                WH_MOUSE_LL,
-                Some(mouse_hook_proc),
-                None,
-                0,
-            )
-            .expect("Failed to set mouse hook");
+            let _ = EnumWindows(Some(enum_windows_proc), LPARAM(0));
+            if let Ok(mut state) = STATE.lock() {
+                state.apply_layout(true);
+            }
 
             let win_hook_create_destroy = SetWinEventHook(
                 EVENT_OBJECT_SHOW,
                 EVENT_OBJECT_HIDE,
+                None,
+                Some(win_event_hook),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+
+            let win_hook_create = SetWinEventHook(
+                EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_DESTROY,
                 None,
                 Some(win_event_hook),
                 0,
@@ -550,8 +778,8 @@ pub fn start_wm() {
                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             );
 
-            let win_hook_movesizeend = SetWinEventHook(
-                EVENT_SYSTEM_MOVESIZEEND,
+            let win_hook_movesize = SetWinEventHook(
+                EVENT_SYSTEM_MOVESIZESTART,
                 EVENT_SYSTEM_MOVESIZEEND,
                 None,
                 Some(win_event_hook),
@@ -571,15 +799,15 @@ pub fn start_wm() {
             );
 
             let mut msg: MSG = MSG::default();
-            while GetMessageW(&mut msg, Some(HWND::default()), 0, 0).into() {
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 let _ = TranslateMessage(&msg);
                 let _ = DispatchMessageW(&msg);
             }
 
-            let _ = UnhookWindowsHookEx(MOUSE_HOOK);
             let _ = UnhookWinEvent(win_hook_create_destroy);
+            let _ = UnhookWinEvent(win_hook_create);
             let _ = UnhookWinEvent(win_hook_minimize);
-            let _ = UnhookWinEvent(win_hook_movesizeend);
+            let _ = UnhookWinEvent(win_hook_movesize);
             let _ = UnhookWinEvent(win_hook_foreground);
         }
     });
