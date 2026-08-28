@@ -21,7 +21,7 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallNextHookEx, DeferWindowPos, DispatchMessageW, EndDeferWindowPos,
     EnumWindows, GetClassNameW, GetForegroundWindow, GetMessageW, GetParent, GetWindowInfo,
@@ -262,7 +262,7 @@ impl WmState {
 
         let max_off = self.max_offset() as f32;
         self.target_offset_x = self.target_offset_x.clamp(0.0, max_off);
-        if !self.config.smooth_scrolling {
+        if !self.config.smooth_scrolling && self.resizing_hwnd.is_none() {
             self.current_offset_x = self.target_offset_x;
         }
         self.current_offset_x = self.current_offset_x.clamp(0.0, max_off);
@@ -727,7 +727,14 @@ unsafe extern "system" fn win_event_hook(
         EVENT_SYSTEM_FOREGROUND => {
             if let Ok(mut state) = STATE.lock() {
                 let added = state.add_window_internal(hwnd);
-                state.focus_window_offset(hwnd);
+
+                // Only center if the left mouse button is not currently held down.
+                // This prevents the window from jumping and breaking native resizing or dragging.
+                let lbutton_pressed = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } & 0x8000_u16 as i16 != 0;
+                if !lbutton_pressed {
+                    state.focus_window_offset(hwnd);
+                }
+
                 if added {
                     LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
                 }
@@ -934,14 +941,16 @@ pub fn start_wm() {
                     let diff = state.target_offset_x - state.current_offset_x;
                     let mut needs_scroll_update = false;
 
-                    if diff.abs() > 0.5 {
-                        is_animating = true;
-                        factor_used = 1.0 - (-22.0 * dt).exp();
-                        state.current_offset_x += diff * factor_used;
-                        needs_scroll_update = true;
-                    } else if state.current_offset_x != state.target_offset_x {
-                        state.current_offset_x = state.target_offset_x;
-                        needs_scroll_update = true;
+                    if state.resizing_hwnd.is_none() {
+                        if diff.abs() > 0.5 {
+                            is_animating = true;
+                            factor_used = 1.0 - (-22.0 * dt).exp();
+                            state.current_offset_x += diff * factor_used;
+                            needs_scroll_update = true;
+                        } else if state.current_offset_x != state.target_offset_x {
+                            state.current_offset_x = state.target_offset_x;
+                            needs_scroll_update = true;
+                        }
                     }
 
                     if dirty {
