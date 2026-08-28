@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { Button } from "./components/ui/button";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "./components/ui/card";
 import { Label } from "./components/ui/label";
@@ -7,6 +8,7 @@ import { Slider } from "./components/ui/slider";
 import { Switch } from "./components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "./components/ui/radio-group";
 import { Separator } from "./components/ui/separator";
+import { DebugOverlay } from "./components/DebugOverlay";
 import "./App.css";
 
 interface WmConfig {
@@ -32,9 +34,19 @@ const DEFAULT_CONFIG: WmConfig = {
 function App() {
   const [config, setConfig] = useState<WmConfig | null>(null);
   const [saved, setSaved] = useState(false);
+  const [debugEnabled, setDebugEnabled] = useState(false);
 
   useEffect(() => {
     invoke<WmConfig>("get_config").then(setConfig);
+    invoke<boolean>("get_debug_state").then(setDebugEnabled);
+
+    const unlisten = listen<boolean>("debug-toggle", (event) => {
+      setDebugEnabled(event.payload);
+    });
+
+    return () => {
+      unlisten.then((fn) => fn());
+    };
   }, []);
 
   useEffect(() => {
@@ -58,13 +70,14 @@ function App() {
   if (!config) return null;
 
   return (
-    <main className="container mx-auto max-w-2xl p-8 pb-12 min-h-screen bg-background text-foreground">
-      <div className="mb-8 space-y-2">
-        <h1 className="text-4xl font-bold tracking-tight">Settings</h1>
-        <p className="text-muted-foreground text-lg">
-          Configure your scrollable tiling window manager.
-        </p>
-      </div>
+    <>
+      <main className="container mx-auto max-w-2xl p-8 pb-12 min-h-screen bg-background text-foreground">
+        <div className="mb-8 space-y-2">
+          <h1 className="text-4xl font-bold tracking-tight">Settings</h1>
+          <p className="text-muted-foreground text-lg">
+            Configure your scrollable tiling window manager.
+          </p>
+        </div>
 
       <div className="space-y-8">
         <Card>
@@ -225,6 +238,8 @@ function App() {
         </div>
       </div>
     </main>
+    {debugEnabled && <DebugOverlay onClose={() => setDebugEnabled(false)} />}
+    </>
   );
 }
 

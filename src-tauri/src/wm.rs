@@ -279,11 +279,10 @@ impl WmState {
 
             let base_flags = SWP_NOZORDER
                 | SWP_NOACTIVATE
-                | SWP_NOCOPYBITS
                 | SWP_NOSENDCHANGING;
 
             let flags = if size_changed {
-                base_flags
+                base_flags | SWP_NOCOPYBITS
             } else {
                 base_flags | SWP_NOSIZE
             };
@@ -454,6 +453,18 @@ pub fn set_config(config: WmConfig) {
         state.apply_layout(true);
     }
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DebugSnapshot {
+    pub dt_ms: f32,
+    pub fps: f32,
+    pub current_offset: f32,
+    pub target_offset: f32,
+    pub smoothing_factor: f32,
+}
+
+pub static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static DEBUG_SNAPSHOT: Lazy<Mutex<DebugSnapshot>> = Lazy::new(|| Mutex::new(DebugSnapshot::default()));
 
 static STATE: Lazy<Mutex<WmState>> = Lazy::new(|| Mutex::new(WmState::new()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -649,68 +660,62 @@ pub fn start_wm() {
         let mut last_tick = Instant::now();
 
         loop {
-            // Process any accumulated scroll wheel inputs
-            let delta = SCROLL_ACCUM.swap(0, Ordering::Relaxed);
-            if delta != 0 {
-                if let Ok(mut state) = STATE.lock() {
+            let mut is_animating = false;
+            let mut factor_used = 0.0;
+            let mut current_offset = 0.0;
+            let mut target_offset = 0.0;
+
+            let now = Instant::now();
+            let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
+
+            if let Ok(mut state) = STATE.lock() {
+                // Process any accumulated scroll wheel inputs
+                let delta = SCROLL_ACCUM.swap(0, Ordering::Relaxed);
+                if delta != 0 {
                     state.scroll(delta);
                 }
-            }
 
-            // Check if animation is active
-            let mut is_animating = false;
-            if let Ok(state) = STATE.lock() {
                 if state.config.enabled && state.config.smooth_scrolling {
-                    is_animating = (state.target_offset_x - state.current_offset_x).abs() > 0.25;
-                }
-            }
-
-            if !is_animating {
-                // Settle exact target offset when near zero
-                if let Ok(mut state) = STATE.lock() {
-                    if state.config.enabled
-                        && state.config.smooth_scrolling
-                        && state.current_offset_x != state.target_offset_x
-                    {
+                    let diff = state.target_offset_x - state.current_offset_x;
+                    if diff.abs() > 0.5 {
+                        is_animating = true;
+                        factor_used = 1.0 - (-22.0 * dt).exp();
+                        state.current_offset_x += diff * factor_used;
+                        state.apply_scroll_frame();
+                    } else if state.current_offset_x != state.target_offset_x {
                         state.current_offset_x = state.target_offset_x;
                         state.apply_scroll_frame();
                     }
                 }
 
+                current_offset = state.current_offset_x;
+                target_offset = state.target_offset_x;
+            }
+
+            if DEBUG_ENABLED.load(Ordering::Relaxed) {
+                if let Ok(mut snap) = DEBUG_SNAPSHOT.lock() {
+                    snap.dt_ms = dt * 1000.0;
+                    snap.fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                    snap.current_offset = current_offset;
+                    snap.target_offset = target_offset;
+                    snap.smoothing_factor = factor_used;
+                }
+            }
+
+            if !is_animating {
                 // Wait for next scroll input with zero-latency wakeup via Condvar
                 if let Ok(lock) = WAKE_MUTEX.lock() {
                     if SCROLL_ACCUM.load(Ordering::Relaxed) == 0 {
                         let _ = WAKE_CONDVAR.wait_timeout(lock, Duration::from_millis(50));
                     }
                 }
-
                 last_tick = Instant::now();
-                continue;
-            }
-
-            // Calculate precise delta-time between monitor VSync frames
-            let now = Instant::now();
-            let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
-            last_tick = now;
-
-            // Frame-rate independent exponential smoothing
-            if let Ok(mut state) = STATE.lock() {
-                if state.config.smooth_scrolling {
-                    let diff = state.target_offset_x - state.current_offset_x;
-                    if diff.abs() > 0.25 {
-                        let factor = 1.0 - (-16.0 * dt).exp();
-                        state.current_offset_x += diff * factor;
-                        state.apply_scroll_frame();
-                    } else {
-                        state.current_offset_x = state.target_offset_x;
-                        state.apply_scroll_frame();
-                    }
+            } else {
+                last_tick = now;
+                // Sync with DWM compositor VSync (adapts to 60Hz, 144Hz, 240Hz, etc.)
+                unsafe {
+                    let _ = DwmFlush();
                 }
-            }
-
-            // Sync with DWM compositor VSync (adapts to 60Hz, 144Hz, 240Hz, etc.)
-            unsafe {
-                let _ = DwmFlush();
             }
         }
     });
