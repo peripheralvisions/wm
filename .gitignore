@@ -1,0 +1,28 @@
+# Rust / Cargo
+/target
+**/*.rs.bk
+
+# Tauri
+/src-tauri/target
+**/*.log
+
+# Node / npm
+node_modules
+dist
+dist-ssr
+
+# Editor
+.idea
+.vscode/*
+!.vscode/extensions.json
+.vscode/*.code-search
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Env
+.env
+.env.*
