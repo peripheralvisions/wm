@@ -10,7 +10,7 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-3.4-38B2AC.svg?style=for-the-badge&logo=tailwind-css&logoColor=white)](https://tailwindcss.com/)
 [![Windows 11](https://img.shields.io/badge/Windows-11_Ready-0078D6.svg?style=for-the-badge&logo=windows-11&logoColor=white)](https://microsoft.com/windows)
 [![Framerate](https://img.shields.io/badge/Refresh_Rate-Up_to_360Hz-brightgreen.svg?style=for-the-badge&logo=speedtest&logoColor=white)](#precision-frame-pacer)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue.svg?style=for-the-badge)](#-license)
 
 <p align="center">
   <b>A modern, high-performance scrollable tiling window manager bringing the paradigm of <a href="https://github.com/YaLTeR/niri">niri</a> to Windows 11.</b>
@@ -300,7 +300,12 @@ Contributions, feature requests, and bug reports are welcome!
 
 ## 📜 License
 
-Distributed under the **MIT License**. See `LICENSE` for more information.
+This project is dual-licensed under either:
+
+- **MIT License** ([`LICENSE-MIT`](LICENSE-MIT))
+- **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE))
+
+at your option.
 
 <div align="center">
   <sub>Crafted with precision for a fluid Windows 11 desktop experience.</sub>
