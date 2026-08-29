@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA,
-    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_NOREDRAW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
@@ -279,7 +279,8 @@ impl WmState {
     }
 
     /// Layout repositioning and sizing.
-    /// Uses BeginDeferWindowPos/EndDeferWindowPos for atomic multi-window update.
+    /// Uses BeginDeferWindowPos/EndDeferWindowPos for atomic multi-window update when sizing,
+    /// and non-blocking asynchronous translation during 144Hz scroll frames.
     fn apply_layout(&mut self, size_changed: bool) {
         if !self.config.enabled {
             return;
@@ -303,65 +304,105 @@ impl WmState {
         unsafe {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
-            // Combine flags: SWP_NOCOPYBITS | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER
-            // SWP_NOCOPYBITS eliminates predictive BitBlt pixel copy artifacts (Chromium swaying/shaking).
-            let flags = if size_changed {
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOCOPYBITS
-            } else {
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOCOPYBITS
-            };
+            if size_changed {
+                // For sizing or final resting position: atomic BeginDeferWindowPos / EndDeferWindowPos
+                let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
+                let window_count = self.windows.len() as i32;
+                let mut hdwp = match BeginDeferWindowPos(window_count) {
+                    Ok(h) if !h.is_invalid() => Some(h),
+                    _ => None,
+                };
 
-            let window_count = self.windows.len() as i32;
-            let mut hdwp = match BeginDeferWindowPos(window_count) {
-                Ok(h) if !h.is_invalid() => Some(h),
-                _ => None,
-            };
+                for w in &self.windows {
+                    let hwnd = w.hwnd.get();
 
-            for w in &self.windows {
-                let hwnd = w.hwnd.get();
-
-                // Skip a window while the user is actively dragging its borders
-                if let Some(ref resizing) = self.resizing_hwnd {
-                    if resizing.0 == w.hwnd.0 {
-                        current_x += w.width + self.config.gap;
-                        continue;
+                    if let Some(ref resizing) = self.resizing_hwnd {
+                        if resizing.0 == w.hwnd.0 {
+                            current_x += w.width + self.config.gap;
+                            continue;
+                        }
                     }
+
+                    let target_x = current_x - w.border_left;
+                    let target_y = self.screen_y + self.config.gap - w.border_top;
+                    let target_w = w.width + w.border_left + w.border_right;
+                    let target_h = (self.screen_height - self.config.gap * 2)
+                        + w.border_top
+                        + w.border_bottom;
+
+                    if let Some(h) = hdwp {
+                        match DeferWindowPos(
+                            h,
+                            hwnd,
+                            Some(HWND::default()),
+                            target_x,
+                            target_y,
+                            target_w,
+                            target_h,
+                            flags,
+                        ) {
+                            Ok(new_h) if !new_h.is_invalid() => {
+                                hdwp = Some(new_h);
+                            }
+                            _ => {
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    Some(HWND::default()),
+                                    target_x,
+                                    target_y,
+                                    target_w,
+                                    target_h,
+                                    flags,
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND::default()),
+                            target_x,
+                            target_y,
+                            target_w,
+                            target_h,
+                            flags,
+                        );
+                    }
+
+                    current_x += w.width + self.config.gap;
                 }
 
-                let target_x = current_x - w.border_left;
-                let target_y = self.screen_y + self.config.gap - w.border_top;
-                let target_w = w.width + w.border_left + w.border_right;
-                let target_h = (self.screen_height - self.config.gap * 2)
-                    + w.border_top
-                    + w.border_bottom;
-
                 if let Some(h) = hdwp {
-                    match DeferWindowPos(
-                        h,
-                        hwnd,
-                        Some(HWND::default()),
-                        target_x,
-                        target_y,
-                        target_w,
-                        target_h,
-                        flags,
-                    ) {
-                        Ok(new_h) if !new_h.is_invalid() => {
-                            hdwp = Some(new_h);
-                        }
-                        _ => {
-                            let _ = SetWindowPos(
-                                hwnd,
-                                Some(HWND::default()),
-                                target_x,
-                                target_y,
-                                target_w,
-                                target_h,
-                                flags,
-                            );
+                    let _ = EndDeferWindowPos(h);
+                }
+            } else {
+                // For active 144Hz scroll translation: direct non-blocking SetWindowPos per window.
+                // Prevents cross-process EndDeferWindowPos serialization contention when multiple
+                // browsers (Chrome, Firefox) and Windows Explorer are open simultaneously.
+                let flags = SWP_NOZORDER
+                    | SWP_NOACTIVATE
+                    | SWP_NOSENDCHANGING
+                    | SWP_ASYNCWINDOWPOS
+                    | SWP_NOSIZE
+                    | SWP_NOCOPYBITS
+                    | SWP_NOREDRAW;
+
+                for w in &self.windows {
+                    let hwnd = w.hwnd.get();
+
+                    if let Some(ref resizing) = self.resizing_hwnd {
+                        if resizing.0 == w.hwnd.0 {
+                            current_x += w.width + self.config.gap;
+                            continue;
                         }
                     }
-                } else {
+
+                    let target_x = current_x - w.border_left;
+                    let target_y = self.screen_y + self.config.gap - w.border_top;
+                    let target_w = w.width + w.border_left + w.border_right;
+                    let target_h = (self.screen_height - self.config.gap * 2)
+                        + w.border_top
+                        + w.border_bottom;
+
                     let _ = SetWindowPos(
                         hwnd,
                         Some(HWND::default()),
@@ -371,13 +412,9 @@ impl WmState {
                         target_h,
                         flags,
                     );
+
+                    current_x += w.width + self.config.gap;
                 }
-
-                current_x += w.width + self.config.gap;
-            }
-
-            if let Some(h) = hdwp {
-                let _ = EndDeferWindowPos(h);
             }
 
             // Synchronize with DWM composition / VBlank
@@ -915,7 +952,7 @@ pub fn start_wm() {
                         } else if state.current_offset_x != state.target_offset_x {
                             state.current_offset_x = state.target_offset_x;
                             state.offset_velocity_x = 0.0;
-                            state.apply_layout(false);
+                            state.apply_layout(true);
                         }
                         factor_used = state.offset_velocity_x;
                     }
