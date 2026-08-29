@@ -98,29 +98,30 @@ All operations are designed for fluid, single-handed or keyboard-centric workflo
 ## 🏗️ Architecture & Engine Internals
 
 ```mermaid
-graph TD
-    subgraph Windows OS
-        WinEvents[WinEvent Hooks<br/>Create / Destroy / Focus / MoveSize]
-        InputHooks[Low-Level Hooks<br/>WH_MOUSE_LL / WH_KEYBOARD_LL]
+flowchart TD
+    subgraph WinOS ["Windows OS"]
+        WinEvents["WinEvent Hooks<br/>Create / Destroy / Focus / MoveSize"]
+        InputHooks["Low-Level Hooks<br/>WH_MOUSE_LL / WH_KEYBOARD_LL"]
+        WinDesktop["Target Application Windows<br/>DWM Extended Frame Bounds"]
     end
 
-    subgraph Rust Core Backend [src-tauri/src/wm.rs]
-        RejectCache[(Rejection Cache<br/>Toolbars / Shell / Overlays)]
-        WinEventThread[WinEvent Thread]
-        InputThread[Input Hook Thread]
+    subgraph RustCore ["Rust Core Backend (src-tauri)"]
+        RejectCache[("Rejection Cache<br/>Toolbars / Shell / Overlays")]
+        WinEventThread["WinEvent Thread"]
+        InputThread["Input Hook Thread"]
         
-        subgraph EngineLoop [Paced Physics Engine - TIME_CRITICAL]
-            WakeSignal{Condvar / Event}
-            Pacer[High-Precision Hybrid Pacer<br/>timeBeginPeriod + Spin Loop]
-            Spring[Analytical Critically Damped Spring]
-            Layout2P[Two-Phase Layout Dispatcher]
+        subgraph EngineLoop ["Paced Physics Engine (TIME_CRITICAL)"]
+            WakeSignal{"Condvar / Wake Event"}
+            Pacer["High-Precision Hybrid Pacer<br/>timeBeginPeriod + Spin Loop"]
+            Spring["Analytical Critically Damped Spring"]
+            Layout2P["Two-Phase Layout Dispatcher"]
         end
     end
 
-    subgraph User Interface [src/]
-        Tray[System Tray Icon]
-        ConfigUI[React 19 + shadcn/ui Dashboard]
-        DebugHUD[Real-Time Performance HUD]
+    subgraph FrontendUI ["User Interface (src)"]
+        Tray["System Tray Icon"]
+        ConfigUI["React 19 + shadcn/ui Dashboard"]
+        DebugHUD["Real-Time Performance HUD"]
     end
 
     WinEvents --> WinEventThread
@@ -133,11 +134,11 @@ graph TD
     WakeSignal --> Pacer
     Pacer --> Spring
     Spring --> Layout2P
-    Layout2P -->|DeferWindowPos / SetWindowPos| Windows OS
+    Layout2P -->|DeferWindowPos / SetWindowPos| WinDesktop
 
     Tray -->|Open| ConfigUI
-    ConfigUI -->|IPC Tauri Commands| EngineLoop
-    EngineLoop -->|Debug Snapshot IPC| DebugHUD
+    ConfigUI -->|IPC Set Config| WakeSignal
+    Layout2P -->|Debug Snapshot IPC| DebugHUD
 ```
 
 ### Dedicated Multi-Threaded Runtime
