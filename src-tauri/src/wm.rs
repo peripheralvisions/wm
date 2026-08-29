@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA,
-    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_NOREDRAW,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_NOREDRAW, SWP_DEFERERASE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
@@ -281,9 +281,9 @@ impl WmState {
     /// Layout repositioning and sizing.
     /// Uses BeginDeferWindowPos/EndDeferWindowPos for atomic multi-window update when sizing,
     /// and non-blocking asynchronous translation during 144Hz scroll frames.
-    fn apply_layout(&mut self, size_changed: bool) {
+    fn apply_layout(&mut self, size_changed: bool) -> bool {
         if !self.config.enabled {
-            return;
+            return false;
         }
 
         let max_off = self.max_offset() as f32;
@@ -295,10 +295,13 @@ impl WmState {
         self.current_offset_x = self.current_offset_x.clamp(0.0, max_off);
 
         if self.windows.is_empty() {
-            return;
+            return false;
         }
 
         let current_offset_int = self.current_offset_x.round() as i32;
+        if !size_changed && current_offset_int == self.last_rendered_int_offset {
+            return false;
+        }
         self.last_rendered_int_offset = current_offset_int;
 
         unsafe {
@@ -384,7 +387,8 @@ impl WmState {
                     | SWP_ASYNCWINDOWPOS
                     | SWP_NOSIZE
                     | SWP_NOCOPYBITS
-                    | SWP_NOREDRAW;
+                    | SWP_NOREDRAW
+                    | SWP_DEFERERASE;
 
                 for w in &self.windows {
                     let hwnd = w.hwnd.get();
@@ -416,10 +420,8 @@ impl WmState {
                     current_x += w.width + self.config.gap;
                 }
             }
-
-            // Synchronize with DWM composition / VBlank
-            let _ = DwmFlush();
         }
+        true
     }
 
     fn scroll(&mut self, delta: i32) {
@@ -907,6 +909,7 @@ pub fn start_wm() {
             let mut factor_used = 0.0;
             let mut current_offset = 0.0;
             let mut target_offset = 0.0;
+            let mut did_update = false;
 
             let now = Instant::now();
             let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
@@ -944,24 +947,32 @@ pub fn start_wm() {
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     if state.resizing_hwnd.is_none() {
-                        let spring_active = state.step_spring(35.0, dt);
+                        let spring_active = state.step_spring(30.0, dt);
 
                         if spring_active {
                             is_animating = true;
-                            state.apply_layout(false);
+                            if state.apply_layout(false) {
+                                did_update = true;
+                            }
                         } else if state.current_offset_x != state.target_offset_x {
                             state.current_offset_x = state.target_offset_x;
                             state.offset_velocity_x = 0.0;
-                            state.apply_layout(true);
+                            if state.apply_layout(true) {
+                                did_update = true;
+                            }
                         }
                         factor_used = state.offset_velocity_x;
                     }
 
                     if dirty {
-                        state.apply_layout(size_changed);
+                        if state.apply_layout(size_changed) {
+                            did_update = true;
+                        }
                     }
                 } else if dirty {
-                    state.apply_layout(size_changed);
+                    if state.apply_layout(size_changed) {
+                        did_update = true;
+                    }
                 }
 
                 current_offset = state.current_offset_x;
@@ -975,6 +986,12 @@ pub fn start_wm() {
                     snap.current_offset = current_offset;
                     snap.target_offset = target_offset;
                     snap.smoothing_factor = factor_used;
+                }
+            }
+
+            if did_update {
+                unsafe {
+                    let _ = DwmFlush();
                 }
             }
 
