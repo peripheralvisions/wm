@@ -308,68 +308,101 @@ impl WmState {
         unsafe {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
-            let flags = if size_changed {
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS
+            if size_changed {
+                let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
+                let window_count = self.windows.len() as i32;
+                let mut hdwp = match BeginDeferWindowPos(window_count) {
+                    Ok(h) if !h.is_invalid() => Some(h),
+                    _ => None,
+                };
+
+                for w in &self.windows {
+                    let hwnd = w.hwnd.get();
+
+                    if let Some(ref resizing) = self.resizing_hwnd {
+                        if resizing.0 == w.hwnd.0 {
+                            current_x += w.width + self.config.gap;
+                            continue;
+                        }
+                    }
+
+                    let target_x = current_x - w.border_left;
+                    let target_y = self.screen_y + self.config.gap - w.border_top;
+                    let target_w = w.width + w.border_left + w.border_right;
+                    let target_h = (self.screen_height - self.config.gap * 2)
+                        + w.border_top
+                        + w.border_bottom;
+
+                    if let Some(h) = hdwp {
+                        match DeferWindowPos(
+                            h,
+                            hwnd,
+                            Some(HWND::default()),
+                            target_x,
+                            target_y,
+                            target_w,
+                            target_h,
+                            flags,
+                        ) {
+                            Ok(new_h) if !new_h.is_invalid() => {
+                                hdwp = Some(new_h);
+                            }
+                            _ => {
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    Some(HWND::default()),
+                                    target_x,
+                                    target_y,
+                                    target_w,
+                                    target_h,
+                                    flags,
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND::default()),
+                            target_x,
+                            target_y,
+                            target_w,
+                            target_h,
+                            flags,
+                        );
+                    }
+
+                    current_x += w.width + self.config.gap;
+                }
+
+                if let Some(h) = hdwp {
+                    let _ = EndDeferWindowPos(h);
+                }
             } else {
-                SWP_NOZORDER
+                let flags = SWP_NOZORDER
                     | SWP_NOACTIVATE
                     | SWP_NOSENDCHANGING
                     | SWP_NOSIZE
                     | SWP_NOCOPYBITS
                     | SWP_NOREDRAW
-                    | SWP_DEFERERASE
-            };
+                    | SWP_DEFERERASE;
 
-            let window_count = self.windows.len() as i32;
-            let mut hdwp = match BeginDeferWindowPos(window_count) {
-                Ok(h) if !h.is_invalid() => Some(h),
-                _ => None,
-            };
+                for w in &self.windows {
+                    let hwnd = w.hwnd.get();
 
-            for w in &self.windows {
-                let hwnd = w.hwnd.get();
-
-                if let Some(ref resizing) = self.resizing_hwnd {
-                    if resizing.0 == w.hwnd.0 {
-                        current_x += w.width + self.config.gap;
-                        continue;
-                    }
-                }
-
-                let target_x = current_x - w.border_left;
-                let target_y = self.screen_y + self.config.gap - w.border_top;
-                let target_w = w.width + w.border_left + w.border_right;
-                let target_h = (self.screen_height - self.config.gap * 2)
-                    + w.border_top
-                    + w.border_bottom;
-
-                if let Some(h) = hdwp {
-                    match DeferWindowPos(
-                        h,
-                        hwnd,
-                        Some(HWND::default()),
-                        target_x,
-                        target_y,
-                        target_w,
-                        target_h,
-                        flags,
-                    ) {
-                        Ok(new_h) if !new_h.is_invalid() => {
-                            hdwp = Some(new_h);
-                        }
-                        _ => {
-                            let _ = SetWindowPos(
-                                hwnd,
-                                Some(HWND::default()),
-                                target_x,
-                                target_y,
-                                target_w,
-                                target_h,
-                                flags,
-                            );
+                    if let Some(ref resizing) = self.resizing_hwnd {
+                        if resizing.0 == w.hwnd.0 {
+                            current_x += w.width + self.config.gap;
+                            continue;
                         }
                     }
-                } else {
+
+                    let target_x = current_x - w.border_left;
+                    let target_y = self.screen_y + self.config.gap - w.border_top;
+                    let target_w = w.width + w.border_left + w.border_right;
+                    let target_h = (self.screen_height - self.config.gap * 2)
+                        + w.border_top
+                        + w.border_bottom;
+
                     let _ = SetWindowPos(
                         hwnd,
                         Some(HWND::default()),
@@ -379,13 +412,9 @@ impl WmState {
                         target_h,
                         flags,
                     );
+
+                    current_x += w.width + self.config.gap;
                 }
-
-                current_x += w.width + self.config.gap;
-            }
-
-            if let Some(h) = hdwp {
-                let _ = EndDeferWindowPos(h);
             }
         }
         true
@@ -948,13 +977,13 @@ pub fn start_wm() {
                 let cur = Instant::now();
                 if next_frame_time > cur {
                     let remaining = next_frame_time - cur;
-                    if remaining > Duration::from_millis(2) {
-                        thread::sleep(remaining - Duration::from_millis(1));
+                    if remaining > Duration::from_millis(3) {
+                        thread::sleep(remaining - Duration::from_millis(2));
                     }
                     while Instant::now() < next_frame_time {
                         std::hint::spin_loop();
                     }
-                } else {
+                } else if cur.duration_since(next_frame_time) > frame_duration * 2 {
                     next_frame_time = cur;
                 }
             } else {
