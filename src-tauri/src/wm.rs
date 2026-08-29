@@ -938,7 +938,7 @@ pub fn start_wm() {
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     if state.resizing_hwnd.is_none() {
-                        let spring_active = state.step_spring(60.0, dt);
+                        let spring_active = state.step_spring(85.0, dt);
 
                         if spring_active {
                             is_animating = true;
@@ -964,8 +964,13 @@ pub fn start_wm() {
 
             if DEBUG_ENABLED.load(Ordering::Relaxed) {
                 if let Ok(mut snap) = DEBUG_SNAPSHOT.lock() {
-                    snap.dt_ms = dt * 1000.0;
-                    snap.fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+                    if is_animating {
+                        snap.dt_ms = dt * 1000.0;
+                        snap.fps = if dt > 0.0 { (1.0 / dt).min(refresh_rate as f32) } else { refresh_rate as f32 };
+                    } else {
+                        snap.dt_ms = frame_duration.as_secs_f32() * 1000.0;
+                        snap.fps = refresh_rate as f32;
+                    }
                     snap.current_offset = current_offset;
                     snap.target_offset = target_offset;
                     snap.smoothing_factor = factor_used;
@@ -996,7 +1001,7 @@ pub fn start_wm() {
                         let _ = WAKE_CONDVAR.wait_timeout(lock, Duration::from_millis(50));
                     }
                 }
-                last_tick = Instant::now();
+                last_tick = Instant::now() - frame_duration;
                 next_frame_time = Instant::now();
             }
         }
@@ -1127,7 +1132,7 @@ mod tests {
         state.offset_velocity_x = 0.0;
 
         let dt = 1.0 / 144.0; // 144 Hz frame time (~6.94ms)
-        let omega = 60.0;
+        let omega = 85.0;
         let mut frames = 0;
         let mut animating = true;
 
@@ -1143,10 +1148,10 @@ mod tests {
             );
         }
 
-        // At omega = 60.0 and 144Hz (dt = 6.94ms), a 600px translation completes
-        // smoothly and critically damped in ~24-26 frames (~170ms).
+        // At omega = 85.0 and 144Hz (dt = 6.94ms), a 600px translation completes
+        // smoothly and critically damped in ~18-20 frames (~125ms).
         assert!(
-            frames <= 30,
+            frames <= 25,
             "Spring took too long to converge at 144Hz: {} frames",
             frames
         );
