@@ -63,7 +63,7 @@ impl Default for WmConfig {
             snap_to_window: false,
             column_sizing_mode: "percent".to_string(),
             column_sizing_value: 50.0,
-            smooth_scrolling: false,
+            smooth_scrolling: true,
         }
     }
 }
@@ -1086,4 +1086,114 @@ pub fn start_wm() {
             let _ = UnhookWinEvent(win_hook_foreground);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = WmConfig::default();
+        assert!(config.enabled);
+        assert!(config.smooth_scrolling);
+        assert_eq!(config.gap, 16);
+        assert_eq!(config.scroll_speed, 100);
+        assert_eq!(config.column_sizing_mode, "percent");
+        assert_eq!(config.column_sizing_value, 50.0);
+    }
+
+    #[test]
+    fn test_critically_damped_spring_144hz_convergence() {
+        let mut state = WmState::new();
+        state.current_offset_x = 0.0;
+        state.target_offset_x = 600.0;
+        state.offset_velocity_x = 0.0;
+
+        let dt = 1.0 / 144.0; // 144 Hz frame time (~6.94ms)
+        let omega = 50.0;
+        let mut frames = 0;
+        let mut animating = true;
+
+        while animating && frames < 60 {
+            animating = state.step_spring(omega, dt);
+            frames += 1;
+
+            // In critically damped spring (zeta = 1.0), there should be NO overshoot
+            assert!(
+                state.current_offset_x <= 600.0 + 0.01,
+                "Spring overshot target at frame {}",
+                frames
+            );
+        }
+
+        // At omega = 50.0 and 144Hz (dt = 6.94ms), a 600px translation completes
+        // smoothly and critically damped in ~30 frames (~208ms).
+        assert!(
+            frames <= 35,
+            "Spring took too long to converge at 144Hz: {} frames",
+            frames
+        );
+        assert_eq!(state.current_offset_x, 600.0);
+        assert_eq!(state.offset_velocity_x, 0.0);
+    }
+
+    #[test]
+    fn test_spring_zero_delta_returns_false() {
+        let mut state = WmState::new();
+        state.current_offset_x = 300.0;
+        state.target_offset_x = 300.0;
+        state.offset_velocity_x = 0.0;
+
+        let dt = 1.0 / 144.0;
+        let omega = 50.0;
+        let animating = state.step_spring(omega, dt);
+
+        assert!(!animating);
+        assert_eq!(state.current_offset_x, 300.0);
+        assert_eq!(state.offset_velocity_x, 0.0);
+    }
+
+    #[test]
+    fn test_max_offset_calculation() {
+        let mut state = WmState::new();
+        state.screen_width = 1920;
+        state.config.gap = 16;
+
+        // No windows: max offset is 0
+        assert_eq!(state.max_offset(), 0);
+
+        // One window smaller than screen: max offset is 0
+        state.windows.push(ManagedWindow {
+            hwnd: SendHwnd(1),
+            width: 900,
+            border_left: 0,
+            border_top: 0,
+            border_right: 0,
+            border_bottom: 0,
+        });
+        // total_width = gap (16) + (900 + 16) = 932 <= 1920 -> max_offset = 0
+        assert_eq!(state.max_offset(), 0);
+
+        // Add 2 more windows: total width exceeds screen
+        state.windows.push(ManagedWindow {
+            hwnd: SendHwnd(2),
+            width: 900,
+            border_left: 0,
+            border_top: 0,
+            border_right: 0,
+            border_bottom: 0,
+        });
+        state.windows.push(ManagedWindow {
+            hwnd: SendHwnd(3),
+            width: 900,
+            border_left: 0,
+            border_top: 0,
+            border_right: 0,
+            border_bottom: 0,
+        });
+        // total_width = 16 + (900+16)*3 = 16 + 2748 = 2764
+        // max_offset = 2764 - 1920 = 844
+        assert_eq!(state.max_offset(), 844);
+    }
 }

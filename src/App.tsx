@@ -28,7 +28,7 @@ const DEFAULT_CONFIG: WmConfig = {
   snap_to_window: false,
   column_sizing_mode: "percent",
   column_sizing_value: 50.0,
-  smooth_scrolling: false,
+  smooth_scrolling: true,
 };
 
 function App() {
