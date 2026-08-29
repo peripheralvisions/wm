@@ -9,33 +9,31 @@ use serde::{Deserialize, Serialize};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED,
-    DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED,
-};
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS,
-    MonitorFromWindow, GetMonitorInfoW, MONITORINFOEXW, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED,
 };
 use windows::Win32::Media::timeBeginPeriod;
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, CallNextHookEx, DeferWindowPos, DispatchMessageW, EndDeferWindowPos,
-    EnumWindows, GetClassNameW, GetForegroundWindow, GetMessageW, GetParent, GetWindowInfo,
-    GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos,
-    SetWindowsHookExW, SystemParametersInfoW, TranslateMessage, UnhookWindowsHookEx,
+    BeginDeferWindowPos, CallNextHookEx, DeferWindowPos,
+    DispatchMessageW, EndDeferWindowPos, EnumWindows, GetClassNameW, GetForegroundWindow,
+    GetMessageW, GetParent, GetWindowInfo, GetWindowLongW, GetWindowThreadProcessId,
+    IsWindowVisible, SetWindowPos, SetWindowsHookExW, SystemParametersInfoW,
+    TranslateMessage, UnhookWindowsHookEx,
     EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
-    MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_NOREDRAW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
-    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MINIMIZE, WS_POPUP, WS_THICKFRAME,
+    MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
+    WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_MINIMIZE, WS_POPUP, WS_THICKFRAME,
 };
-
 
 #[derive(Clone, Debug)]
 pub enum WmAction {
@@ -98,6 +96,7 @@ struct WmState {
     windows: Vec<ManagedWindow>,
     current_offset_x: f32,
     target_offset_x: f32,
+    offset_velocity_x: f32,
     screen_x: i32,
     screen_y: i32,
     screen_width: i32,
@@ -113,6 +112,7 @@ impl WmState {
             windows: Vec::new(),
             current_offset_x: 0.0,
             target_offset_x: 0.0,
+            offset_velocity_x: 0.0,
             screen_x: 0,
             screen_y: 0,
             screen_width: 1920,
@@ -120,6 +120,31 @@ impl WmState {
             config: WmConfig::default(),
             resizing_hwnd: None,
             last_rendered_int_offset: i32::MIN,
+        }
+    }
+
+    /// Solves a critically damped spring oscillator analytically:
+    /// y''(t) + 2*omega*y'(t) + omega^2*y(t) = 0
+    /// Returns true if still animating.
+    fn step_spring(&mut self, omega: f32, dt: f32) -> bool {
+        let diff = self.current_offset_x - self.target_offset_x;
+        if diff.abs() < 0.5 && self.offset_velocity_x.abs() < 5.0 {
+            self.current_offset_x = self.target_offset_x;
+            self.offset_velocity_x = 0.0;
+            return false;
+        }
+
+        let exp = (-omega * dt).exp();
+        let temp = (self.offset_velocity_x + omega * diff) * dt;
+        self.current_offset_x = self.target_offset_x + (diff + temp) * exp;
+        self.offset_velocity_x = (self.offset_velocity_x - omega * temp) * exp;
+
+        if (self.current_offset_x - self.target_offset_x).abs() < 0.5 && self.offset_velocity_x.abs() < 5.0 {
+            self.current_offset_x = self.target_offset_x;
+            self.offset_velocity_x = 0.0;
+            false
+        } else {
+            true
         }
     }
 
@@ -264,6 +289,7 @@ impl WmState {
         self.target_offset_x = self.target_offset_x.clamp(0.0, max_off);
         if !self.config.smooth_scrolling && self.resizing_hwnd.is_none() {
             self.current_offset_x = self.target_offset_x;
+            self.offset_velocity_x = 0.0;
         }
         self.current_offset_x = self.current_offset_x.clamp(0.0, max_off);
 
@@ -277,25 +303,18 @@ impl WmState {
         unsafe {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
+            // Combine flags: SWP_NOCOPYBITS | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER
+            // SWP_NOCOPYBITS eliminates predictive BitBlt pixel copy artifacts (Chromium swaying/shaking).
             let flags = if size_changed {
-                // For resizing, we want synchronous updates so windows repaint immediately.
-                // We omit SWP_ASYNCWINDOWPOS and SWP_NOSENDCHANGING.
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOCOPYBITS
             } else {
-                // For scrolling, we translate asynchronously to prevent blocking our 144Hz loop.
-                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOCOPYBITS | SWP_NOREDRAW
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOCOPYBITS
             };
 
-            // Only use DeferWindowPos for resizing, as it blocks scrolling animation even with SWP_ASYNCWINDOWPOS
-            let use_defer = size_changed;
-            let mut hdwp = if use_defer {
-                let window_count = self.windows.len() as i32;
-                match BeginDeferWindowPos(window_count) {
-                    Ok(h) if !h.is_invalid() => Some(h),
-                    _ => None,
-                }
-            } else {
-                None
+            let window_count = self.windows.len() as i32;
+            let mut hdwp = match BeginDeferWindowPos(window_count) {
+                Ok(h) if !h.is_invalid() => Some(h),
+                _ => None,
             };
 
             for w in &self.windows {
@@ -360,16 +379,10 @@ impl WmState {
             if let Some(h) = hdwp {
                 let _ = EndDeferWindowPos(h);
             }
-        }
-    }
 
-    /// Fast translation-only update for smooth scrolling frames.
-    fn apply_scroll_frame(&mut self) {
-        let current_offset_int = self.current_offset_x.round() as i32;
-        if current_offset_int == self.last_rendered_int_offset {
-            return;
+            // Synchronize with DWM composition / VBlank
+            let _ = DwmFlush();
         }
-        self.apply_layout(false);
     }
 
     fn scroll(&mut self, delta: i32) {
@@ -416,6 +429,7 @@ impl WmState {
 
         if !self.config.smooth_scrolling {
             self.current_offset_x = self.target_offset_x;
+            self.offset_velocity_x = 0.0;
         }
     }
 
@@ -439,6 +453,7 @@ impl WmState {
 
                 if !self.config.smooth_scrolling {
                     self.current_offset_x = self.target_offset_x;
+                    self.offset_velocity_x = 0.0;
                 }
                 break;
             }
@@ -489,7 +504,6 @@ impl WmState {
         }
     }
 }
-
 
 pub fn get_config() -> WmConfig {
     if let Ok(state) = STATE.lock() {
@@ -828,7 +842,6 @@ unsafe extern "system" fn keyboard_hook_proc(
     CallNextHookEx(None, ncode, wparam, lparam)
 }
 
-
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
     if is_manageable(hwnd).0 {
         if let Ok(mut state) = STATE.lock() {
@@ -838,48 +851,12 @@ unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::c
     true.into()
 }
 
-fn get_refresh_rate(hwnd: Option<HWND>) -> u32 {
-    unsafe {
-        let hmonitor = if let Some(h) = hwnd {
-            MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY)
-        } else {
-            MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY)
-        };
-
-        if !hmonitor.is_invalid() {
-            let mut monitor_info = MONITORINFOEXW::default();
-            monitor_info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-            let lpmi = &mut monitor_info as *mut MONITORINFOEXW as *mut MONITORINFO;
-            if GetMonitorInfoW(hmonitor, lpmi).as_bool() {
-                let mut devmode = DEVMODEW::default();
-                devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-                let device_name = windows::core::PCWSTR::from_raw(monitor_info.szDevice.as_ptr());
-                if EnumDisplaySettingsW(device_name, ENUM_CURRENT_SETTINGS, &mut devmode).as_bool() {
-                    if devmode.dmDisplayFrequency > 0 {
-                        return devmode.dmDisplayFrequency;
-                    }
-                }
-            }
-        }
-
-        // Fallback to primary display using None
-        let mut devmode = DEVMODEW::default();
-        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-        if EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut devmode).as_bool() {
-            if devmode.dmDisplayFrequency > 0 {
-                return devmode.dmDisplayFrequency;
-            }
-        }
-    }
-    60 // Safe fallback
-}
-
 pub fn start_wm() {
     if RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
 
-    // 1. High-precision physics/animation loop paced directly by the hardware refresh rate.
+    // 1. High-precision physics/animation loop paced directly by DwmFlush (hardware VBlank).
     thread::spawn(move || {
         unsafe {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
@@ -887,15 +864,6 @@ pub fn start_wm() {
         }
         let mut last_tick = Instant::now();
         let mut actions = Vec::with_capacity(8);
-
-        // Cache QPC frequency (constant for the life of the process)
-        let qpc_freq: u64 = unsafe {
-            let mut freq = 0i64;
-            let _ = QueryPerformanceFrequency(&mut freq);
-            freq as u64
-        };
-        let mut next_target_qpc = 0u64;
-        let mut target_period = 0u64;
 
         loop {
             let mut is_animating = false;
@@ -938,27 +906,22 @@ pub fn start_wm() {
                 let size_changed = LAYOUT_SIZE_CHANGED.swap(false, Ordering::Relaxed);
 
                 if state.config.enabled && state.config.smooth_scrolling {
-                    let diff = state.target_offset_x - state.current_offset_x;
-                    let mut needs_scroll_update = false;
-
                     if state.resizing_hwnd.is_none() {
-                        if diff.abs() > 0.5 {
+                        let spring_active = state.step_spring(35.0, dt);
+
+                        if spring_active {
                             is_animating = true;
-                            factor_used = 1.0 - (-22.0 * dt).exp();
-                            state.current_offset_x += diff * factor_used;
-                            needs_scroll_update = true;
+                            state.apply_layout(false);
                         } else if state.current_offset_x != state.target_offset_x {
                             state.current_offset_x = state.target_offset_x;
-                            needs_scroll_update = true;
+                            state.offset_velocity_x = 0.0;
+                            state.apply_layout(false);
                         }
+                        factor_used = state.offset_velocity_x;
                     }
 
                     if dirty {
-                        // Priority: if layout changed, we MUST apply layout and pass size_changed.
-                        // This handles the resize immediately without being swallowed by the animation frame.
                         state.apply_layout(size_changed);
-                    } else if needs_scroll_update {
-                        state.apply_scroll_frame();
                     }
                 } else if dirty {
                     state.apply_layout(size_changed);
@@ -978,54 +941,7 @@ pub fn start_wm() {
                 }
             }
 
-            if is_animating {
-                unsafe {
-                    let mut now_qpc = 0i64;
-                    let _ = QueryPerformanceCounter(&mut now_qpc);
-                    let now_qpc = now_qpc as u64;
-
-                    if next_target_qpc == 0 {
-                        // First frame of animation: query hardware refresh rate
-                        let fw = GetForegroundWindow();
-                        let refresh_rate = get_refresh_rate(if fw.0.is_null() { None } else { Some(fw) }).max(30);
-                        target_period = qpc_freq / refresh_rate as u64;
-                        next_target_qpc = now_qpc + target_period;
-                    } else {
-                        // Advance exactly by the hardware refresh period
-                        next_target_qpc += target_period;
-                    }
-
-                    // If we fell behind by more than 2 frames, resync target to now + target_period
-                    if now_qpc > next_target_qpc + target_period * 2 {
-                        next_target_qpc = now_qpc + target_period;
-                    }
-
-                    let ticks_to_sleep = next_target_qpc.saturating_sub(now_qpc);
-                    let nanos = ticks_to_sleep
-                        .saturating_mul(1_000_000_000)
-                        .checked_div(qpc_freq)
-                        .unwrap_or(0);
-
-                    if nanos > 0 {
-                        // Sleep the bulk of the time (save CPU), stopping 1.5ms early
-                        if nanos > 1_500_000 {
-                            thread::sleep(Duration::from_nanos(nanos - 1_500_000));
-                        }
-
-                        // Spin-wait the final <1.5ms for perfect microsecond pacing
-                        loop {
-                            let mut current = 0i64;
-                            let _ = QueryPerformanceCounter(&mut current);
-                            if (current as u64) >= next_target_qpc {
-                                break;
-                            }
-                            std::hint::spin_loop();
-                        }
-                    }
-                }
-            } else {
-                next_target_qpc = 0; // Reset metronome when animation stops
-
+            if !is_animating {
                 // Nothing to animate: sleep until woken by input or 50 ms timeout.
                 // Reset last_tick after sleeping so dt doesn't include sleep time.
                 if let Ok(lock) = WAKE_MUTEX.lock() {
