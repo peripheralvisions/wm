@@ -128,7 +128,7 @@ impl WmState {
     /// Returns true if still animating.
     fn step_spring(&mut self, omega: f32, dt: f32) -> bool {
         let diff = self.current_offset_x - self.target_offset_x;
-        if diff.abs() < 0.5 && self.offset_velocity_x.abs() < 5.0 {
+        if diff.abs() < 0.5 && self.offset_velocity_x.abs() < 10.0 {
             self.current_offset_x = self.target_offset_x;
             self.offset_velocity_x = 0.0;
             return false;
@@ -139,7 +139,7 @@ impl WmState {
         self.current_offset_x = self.target_offset_x + (diff + temp) * exp;
         self.offset_velocity_x = (self.offset_velocity_x - omega * temp) * exp;
 
-        if (self.current_offset_x - self.target_offset_x).abs() < 0.5 && self.offset_velocity_x.abs() < 5.0 {
+        if (self.current_offset_x - self.target_offset_x).abs() < 0.5 && self.offset_velocity_x.abs() < 10.0 {
             self.current_offset_x = self.target_offset_x;
             self.offset_velocity_x = 0.0;
             false
@@ -280,7 +280,7 @@ impl WmState {
 
     /// Layout repositioning and sizing.
     /// Uses BeginDeferWindowPos/EndDeferWindowPos for atomic multi-window update when sizing,
-    /// and non-blocking asynchronous translation during 144Hz scroll frames.
+    /// and non-blocking asynchronous translation during scroll frames.
     fn apply_layout(&mut self, size_changed: bool) -> bool {
         if !self.config.enabled {
             return false;
@@ -308,7 +308,6 @@ impl WmState {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
             if size_changed {
-                // For sizing or final resting position: atomic BeginDeferWindowPos / EndDeferWindowPos
                 let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
                 let window_count = self.windows.len() as i32;
                 let mut hdwp = match BeginDeferWindowPos(window_count) {
@@ -378,9 +377,6 @@ impl WmState {
                     let _ = EndDeferWindowPos(h);
                 }
             } else {
-                // For active 144Hz scroll translation: direct non-blocking SetWindowPos per window.
-                // Prevents cross-process EndDeferWindowPos serialization contention when multiple
-                // browsers (Chrome, Firefox) and Windows Explorer are open simultaneously.
                 let flags = SWP_NOZORDER
                     | SWP_NOACTIVATE
                     | SWP_NOSENDCHANGING
@@ -578,9 +574,6 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 static SCROLL_ACCUM: AtomicI32 = AtomicI32::new(0);
 
 // Dirty flags: set by hook threads, consumed by the animation loop.
-// This ensures layout passes only happen at the animation loop's cadence,
-// coalescing any burst of WinEvents (e.g. browser opening dozens of sub-windows)
-// into a single layout pass per frame.
 static LAYOUT_DIRTY: AtomicBool = AtomicBool::new(false);
 static LAYOUT_SIZE_CHANGED: AtomicBool = AtomicBool::new(false);
 
@@ -588,12 +581,9 @@ static LAYOUT_SIZE_CHANGED: AtomicBool = AtomicBool::new(false);
 static WAKE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static WAKE_CONDVAR: Lazy<Condvar> = Lazy::new(Condvar::new);
 
-// Cache of HWNDs that failed is_manageable() — avoids re-running the full check
-// (multiple Win32 API calls) for the same non-manageable window on every event.
-// Evicted when the window is destroyed.
+// Cache of HWNDs that failed is_manageable()
 static REJECTED_CACHE: Lazy<Mutex<HashSet<isize>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
-// Returns (is_manageable, is_permanently_rejected)
 fn is_manageable(hwnd: HWND) -> (bool, bool) {
     unsafe {
         if hwnd.0.is_null() {
@@ -610,7 +600,6 @@ fn is_manageable(hwnd: HWND) -> (bool, bool) {
         .is_ok()
         {
             if cloaked != 0 {
-                // Cloaked state is dynamic, do not permanently reject
                 return (false, false);
             }
         }
@@ -694,7 +683,6 @@ unsafe extern "system" fn win_event_hook(
     }
 
     if event == EVENT_OBJECT_DESTROY {
-        // Evict from rejected cache so it can be re-evaluated if the handle is reused.
         if let Ok(mut cache) = REJECTED_CACHE.lock() {
             cache.remove(&(hwnd.0 as isize));
         }
@@ -718,7 +706,6 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    // Capture resize start so smooth scrolling/layout won't fight the user's manual dragging
     if event == EVENT_SYSTEM_MOVESIZESTART {
         if let Ok(mut state) = STATE.lock() {
             state.resizing_hwnd = Some(SendHwnd::new(hwnd));
@@ -726,20 +713,17 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    // Resize/move finished: update width and re-tile cleanly
     if event == EVENT_SYSTEM_MOVESIZEEND {
         if let Ok(mut state) = STATE.lock() {
             state.resizing_hwnd = None;
             state.update_window_size(hwnd);
+            LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+            LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+            WAKE_CONDVAR.notify_one();
         }
-        LAYOUT_DIRTY.store(true, Ordering::Relaxed);
-        LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
-        WAKE_CONDVAR.notify_one();
         return;
     }
 
-    // Check the rejected cache first to avoid redundant Win32 calls for known
-    // non-manageable windows (browser internal sub-windows fire many events).
     let hwnd_key = hwnd.0 as isize;
     if let Ok(cache) = REJECTED_CACHE.lock() {
         if cache.contains(&hwnd_key) {
@@ -765,7 +749,6 @@ unsafe extern "system" fn win_event_hook(
                 false
             };
             if added {
-                // Check foreground outside the STATE lock to avoid deadlock
                 let is_fg = unsafe { GetForegroundWindow() == hwnd };
                 if is_fg {
                     if let Ok(mut state) = STATE.lock() {
@@ -781,8 +764,6 @@ unsafe extern "system" fn win_event_hook(
             if let Ok(mut state) = STATE.lock() {
                 let added = state.add_window_internal(hwnd);
 
-                // Only center if the left mouse button is not currently held down.
-                // This prevents the window from jumping and breaking native resizing or dragging.
                 let lbutton_pressed = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } & 0x8000_u16 as i16 != 0;
                 if !lbutton_pressed {
                     state.focus_window_offset(hwnd);
@@ -799,8 +780,6 @@ unsafe extern "system" fn win_event_hook(
     }
 }
 
-// Dedicated, non-blocking low-level mouse hook procedure.
-// Must never perform I/O, heavy computation, or mutex locking.
 unsafe extern "system" fn mouse_hook_proc(
     ncode: i32,
     wparam: WPARAM,
@@ -818,8 +797,6 @@ unsafe extern "system" fn mouse_hook_proc(
             let delta = (mouse_data >> 16) as i16;
 
             if is_shift {
-                // scroll down (delta < 0) = move left/back (-1)
-                // scroll up (delta > 0) = move right/forward (+1)
                 let dir = if delta > 0 { 1 } else { -1 };
                 if let Ok(mut lock) = ACTIONS.lock() {
                     lock.push(WmAction::MoveWindow(dir));
@@ -941,13 +918,12 @@ pub fn start_wm() {
                     LAYOUT_DIRTY.store(true, Ordering::Relaxed);
                 }
 
-                // Process dirty layout flag — coalesces all WinEvent-driven layout requests
                 let dirty = LAYOUT_DIRTY.swap(false, Ordering::Relaxed);
                 let size_changed = LAYOUT_SIZE_CHANGED.swap(false, Ordering::Relaxed);
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     if state.resizing_hwnd.is_none() {
-                        let spring_active = state.step_spring(30.0, dt);
+                        let spring_active = state.step_spring(50.0, dt);
 
                         if spring_active {
                             is_animating = true;
@@ -996,8 +972,6 @@ pub fn start_wm() {
             }
 
             if !is_animating {
-                // Nothing to animate: sleep until woken by input or 50 ms timeout.
-                // Reset last_tick after sleeping so dt doesn't include sleep time.
                 if let Ok(lock) = WAKE_MUTEX.lock() {
                     let actions_empty = ACTIONS.lock().map(|a| a.is_empty()).unwrap_or(true);
                     if SCROLL_ACCUM.load(Ordering::Relaxed) == 0
@@ -1012,7 +986,7 @@ pub fn start_wm() {
         }
     });
 
-    // 2. Dedicated Input Hook Thread (Isolated from WinEvents and Layout to prevent timeouts)
+    // 2. Dedicated Input Hook Thread
     thread::spawn(move || {
         unsafe {
             let hinstance = match GetModuleHandleW(None) {
