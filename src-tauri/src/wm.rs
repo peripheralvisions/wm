@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
+    DwmGetWindowAttribute, DwmSetWindowAttribute,
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED,
 };
+use windows::Win32::Graphics::Gdi::{EnumDisplaySettingsW, DEVMODEW, ENUM_CURRENT_SETTINGS};
 use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
@@ -27,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA,
-    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_ASYNCWINDOWPOS, SWP_NOREDRAW, SWP_DEFERERASE,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_NOREDRAW, SWP_DEFERERASE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
     WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
@@ -307,102 +308,68 @@ impl WmState {
         unsafe {
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
-            if size_changed {
-                let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
-                let window_count = self.windows.len() as i32;
-                let mut hdwp = match BeginDeferWindowPos(window_count) {
-                    Ok(h) if !h.is_invalid() => Some(h),
-                    _ => None,
-                };
-
-                for w in &self.windows {
-                    let hwnd = w.hwnd.get();
-
-                    if let Some(ref resizing) = self.resizing_hwnd {
-                        if resizing.0 == w.hwnd.0 {
-                            current_x += w.width + self.config.gap;
-                            continue;
-                        }
-                    }
-
-                    let target_x = current_x - w.border_left;
-                    let target_y = self.screen_y + self.config.gap - w.border_top;
-                    let target_w = w.width + w.border_left + w.border_right;
-                    let target_h = (self.screen_height - self.config.gap * 2)
-                        + w.border_top
-                        + w.border_bottom;
-
-                    if let Some(h) = hdwp {
-                        match DeferWindowPos(
-                            h,
-                            hwnd,
-                            Some(HWND::default()),
-                            target_x,
-                            target_y,
-                            target_w,
-                            target_h,
-                            flags,
-                        ) {
-                            Ok(new_h) if !new_h.is_invalid() => {
-                                hdwp = Some(new_h);
-                            }
-                            _ => {
-                                let _ = SetWindowPos(
-                                    hwnd,
-                                    Some(HWND::default()),
-                                    target_x,
-                                    target_y,
-                                    target_w,
-                                    target_h,
-                                    flags,
-                                );
-                            }
-                        }
-                    } else {
-                        let _ = SetWindowPos(
-                            hwnd,
-                            Some(HWND::default()),
-                            target_x,
-                            target_y,
-                            target_w,
-                            target_h,
-                            flags,
-                        );
-                    }
-
-                    current_x += w.width + self.config.gap;
-                }
-
-                if let Some(h) = hdwp {
-                    let _ = EndDeferWindowPos(h);
-                }
+            let flags = if size_changed {
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS
             } else {
-                let flags = SWP_NOZORDER
+                SWP_NOZORDER
                     | SWP_NOACTIVATE
                     | SWP_NOSENDCHANGING
-                    | SWP_ASYNCWINDOWPOS
                     | SWP_NOSIZE
                     | SWP_NOCOPYBITS
                     | SWP_NOREDRAW
-                    | SWP_DEFERERASE;
+                    | SWP_DEFERERASE
+            };
 
-                for w in &self.windows {
-                    let hwnd = w.hwnd.get();
+            let window_count = self.windows.len() as i32;
+            let mut hdwp = match BeginDeferWindowPos(window_count) {
+                Ok(h) if !h.is_invalid() => Some(h),
+                _ => None,
+            };
 
-                    if let Some(ref resizing) = self.resizing_hwnd {
-                        if resizing.0 == w.hwnd.0 {
-                            current_x += w.width + self.config.gap;
-                            continue;
+            for w in &self.windows {
+                let hwnd = w.hwnd.get();
+
+                if let Some(ref resizing) = self.resizing_hwnd {
+                    if resizing.0 == w.hwnd.0 {
+                        current_x += w.width + self.config.gap;
+                        continue;
+                    }
+                }
+
+                let target_x = current_x - w.border_left;
+                let target_y = self.screen_y + self.config.gap - w.border_top;
+                let target_w = w.width + w.border_left + w.border_right;
+                let target_h = (self.screen_height - self.config.gap * 2)
+                    + w.border_top
+                    + w.border_bottom;
+
+                if let Some(h) = hdwp {
+                    match DeferWindowPos(
+                        h,
+                        hwnd,
+                        Some(HWND::default()),
+                        target_x,
+                        target_y,
+                        target_w,
+                        target_h,
+                        flags,
+                    ) {
+                        Ok(new_h) if !new_h.is_invalid() => {
+                            hdwp = Some(new_h);
+                        }
+                        _ => {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND::default()),
+                                target_x,
+                                target_y,
+                                target_w,
+                                target_h,
+                                flags,
+                            );
                         }
                     }
-
-                    let target_x = current_x - w.border_left;
-                    let target_y = self.screen_y + self.config.gap - w.border_top;
-                    let target_w = w.width + w.border_left + w.border_right;
-                    let target_h = (self.screen_height - self.config.gap * 2)
-                        + w.border_top
-                        + w.border_bottom;
-
+                } else {
                     let _ = SetWindowPos(
                         hwnd,
                         Some(HWND::default()),
@@ -412,9 +379,13 @@ impl WmState {
                         target_h,
                         flags,
                     );
-
-                    current_x += w.width + self.config.gap;
                 }
+
+                current_x += w.width + self.config.gap;
+            }
+
+            if let Some(h) = hdwp {
+                let _ = EndDeferWindowPos(h);
             }
         }
         true
@@ -858,6 +829,19 @@ unsafe extern "system" fn keyboard_hook_proc(
     CallNextHookEx(None, ncode, wparam, lparam)
 }
 
+fn get_refresh_rate() -> u32 {
+    unsafe {
+        let mut devmode = DEVMODEW::default();
+        devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+        if EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut devmode).as_bool() {
+            if devmode.dmDisplayFrequency >= 30 {
+                return devmode.dmDisplayFrequency;
+            }
+        }
+    }
+    144
+}
+
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
     if is_manageable(hwnd).0 {
         if let Ok(mut state) = STATE.lock() {
@@ -872,13 +856,16 @@ pub fn start_wm() {
         return;
     }
 
-    // 1. High-precision physics/animation loop paced directly by DwmFlush (hardware VBlank).
+    // 1. High-precision physics/animation loop paced at native monitor refresh rate (e.g. 144Hz).
     thread::spawn(move || {
         unsafe {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
             let _ = timeBeginPeriod(1);
         }
+        let refresh_rate = get_refresh_rate().clamp(60, 360);
+        let frame_duration = Duration::from_secs_f64(1.0 / refresh_rate as f64);
         let mut last_tick = Instant::now();
+        let mut next_frame_time = Instant::now();
         let mut actions = Vec::with_capacity(8);
 
         loop {
@@ -886,7 +873,6 @@ pub fn start_wm() {
             let mut factor_used = 0.0;
             let mut current_offset = 0.0;
             let mut target_offset = 0.0;
-            let mut did_update = false;
 
             let now = Instant::now();
             let dt = (now - last_tick).as_secs_f32().clamp(0.0005, 0.05);
@@ -923,32 +909,24 @@ pub fn start_wm() {
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     if state.resizing_hwnd.is_none() {
-                        let spring_active = state.step_spring(50.0, dt);
+                        let spring_active = state.step_spring(60.0, dt);
 
                         if spring_active {
                             is_animating = true;
-                            if state.apply_layout(false) {
-                                did_update = true;
-                            }
+                            state.apply_layout(false);
                         } else if state.current_offset_x != state.target_offset_x {
                             state.current_offset_x = state.target_offset_x;
                             state.offset_velocity_x = 0.0;
-                            if state.apply_layout(true) {
-                                did_update = true;
-                            }
+                            state.apply_layout(true);
                         }
                         factor_used = state.offset_velocity_x;
                     }
 
                     if dirty {
-                        if state.apply_layout(size_changed) {
-                            did_update = true;
-                        }
+                        state.apply_layout(size_changed);
                     }
                 } else if dirty {
-                    if state.apply_layout(size_changed) {
-                        did_update = true;
-                    }
+                    state.apply_layout(size_changed);
                 }
 
                 current_offset = state.current_offset_x;
@@ -965,13 +943,21 @@ pub fn start_wm() {
                 }
             }
 
-            if did_update {
-                unsafe {
-                    let _ = DwmFlush();
+            if is_animating {
+                next_frame_time += frame_duration;
+                let cur = Instant::now();
+                if next_frame_time > cur {
+                    let remaining = next_frame_time - cur;
+                    if remaining > Duration::from_millis(2) {
+                        thread::sleep(remaining - Duration::from_millis(1));
+                    }
+                    while Instant::now() < next_frame_time {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    next_frame_time = cur;
                 }
-            }
-
-            if !is_animating {
+            } else {
                 if let Ok(lock) = WAKE_MUTEX.lock() {
                     let actions_empty = ACTIONS.lock().map(|a| a.is_empty()).unwrap_or(true);
                     if SCROLL_ACCUM.load(Ordering::Relaxed) == 0
@@ -982,6 +968,7 @@ pub fn start_wm() {
                     }
                 }
                 last_tick = Instant::now();
+                next_frame_time = Instant::now();
             }
         }
     });
@@ -1111,7 +1098,7 @@ mod tests {
         state.offset_velocity_x = 0.0;
 
         let dt = 1.0 / 144.0; // 144 Hz frame time (~6.94ms)
-        let omega = 50.0;
+        let omega = 60.0;
         let mut frames = 0;
         let mut animating = true;
 
@@ -1127,10 +1114,10 @@ mod tests {
             );
         }
 
-        // At omega = 50.0 and 144Hz (dt = 6.94ms), a 600px translation completes
-        // smoothly and critically damped in ~30 frames (~208ms).
+        // At omega = 60.0 and 144Hz (dt = 6.94ms), a 600px translation completes
+        // smoothly and critically damped in ~24-26 frames (~170ms).
         assert!(
-            frames <= 35,
+            frames <= 30,
             "Spring took too long to converge at 144Hz: {} frames",
             frames
         );
