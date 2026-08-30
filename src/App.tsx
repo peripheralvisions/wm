@@ -19,6 +19,7 @@ interface WmConfig {
   column_sizing_mode: string;
   column_sizing_value: number;
   smooth_scrolling: boolean;
+  block_alt_menu: boolean;
 }
 
 const DEFAULT_CONFIG: WmConfig = {
@@ -29,6 +30,7 @@ const DEFAULT_CONFIG: WmConfig = {
   column_sizing_mode: "percent",
   column_sizing_value: 50.0,
   smooth_scrolling: true,
+  block_alt_menu: true,
 };
 
 function App() {
@@ -83,9 +85,9 @@ function App() {
         <Card>
           <CardHeader>
             <CardTitle>General</CardTitle>
-            <CardDescription>Core functionality of the window manager.</CardDescription>
+            <CardDescription>Core functionality and system interaction.</CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-6">
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
                 <Label className="text-base">Enable Tiling</Label>
@@ -96,6 +98,21 @@ function App() {
               <Switch
                 checked={config.enabled}
                 onCheckedChange={(v) => setConfig({ ...config, enabled: v })}
+              />
+            </div>
+
+            <Separator />
+
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <Label className="text-base">Prevent Alt Menu Bar</Label>
+                <p className="text-sm text-muted-foreground">
+                  Prevent pressing Alt from opening application menu bars (e.g. in Firefox or File Explorer).
+                </p>
+              </div>
+              <Switch
+                checked={config.block_alt_menu}
+                onCheckedChange={(v) => setConfig({ ...config, block_alt_menu: v })}
               />
             </div>
           </CardContent>

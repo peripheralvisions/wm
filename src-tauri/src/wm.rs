@@ -16,7 +16,10 @@ use windows::Win32::Media::timeBeginPeriod;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    keybd_event, GetAsyncKeyState, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_LBUTTON, VK_LEFT,
+    VK_LMENU, VK_MENU, VK_RIGHT, VK_RMENU, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallNextHookEx, DeferWindowPos,
     DispatchMessageW, EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
@@ -30,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA,
     SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_NOREDRAW, SWP_DEFERERASE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_SYSKEYDOWN, WH_MOUSE_LL, WINDOWINFO,
+    WH_KEYBOARD_LL, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WH_MOUSE_LL, WINDOWINFO,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_MOUSEWHEEL,
     WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     WS_MINIMIZE, WS_POPUP, WS_THICKFRAME,
@@ -53,6 +56,7 @@ pub struct WmConfig {
     pub column_sizing_mode: String,
     pub column_sizing_value: f32,
     pub smooth_scrolling: bool,
+    pub block_alt_menu: bool,
 }
 
 impl Default for WmConfig {
@@ -65,6 +69,7 @@ impl Default for WmConfig {
             column_sizing_mode: "percent".to_string(),
             column_sizing_value: 50.0,
             smooth_scrolling: true,
+            block_alt_menu: true,
         }
     }
 }
@@ -589,6 +594,7 @@ pub fn get_config() -> WmConfig {
 }
 
 pub fn set_config(config: WmConfig) {
+    BLOCK_ALT_MENU.store(config.block_alt_menu, Ordering::Relaxed);
     if let Ok(mut state) = STATE.lock() {
         state.config = config;
     }
@@ -608,6 +614,7 @@ pub struct DebugSnapshot {
 
 pub static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 pub static DEBUG_SNAPSHOT: Lazy<Mutex<DebugSnapshot>> = Lazy::new(|| Mutex::new(DebugSnapshot::default()));
+pub static BLOCK_ALT_MENU: AtomicBool = AtomicBool::new(true);
 
 static STATE: Lazy<Mutex<WmState>> = Lazy::new(|| Mutex::new(WmState::new()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -706,17 +713,24 @@ unsafe extern "system" fn win_event_hook(
     event: u32,
     hwnd: HWND,
     idobject: i32,
-    _idchild: i32,
+    idchild: i32,
     _ideventthread: u32,
     _dwmseventtime: u32,
 ) {
-    if idobject != OBJID_WINDOW.0 {
+    if idobject != OBJID_WINDOW.0 || idchild != 0 {
         return;
     }
 
+    let root_hwnd = GetAncestor(hwnd, GA_ROOT);
+    let target_hwnd = if !root_hwnd.0.is_null() && IsWindow(Some(root_hwnd)).as_bool() {
+        root_hwnd
+    } else {
+        hwnd
+    };
+
     if event == EVENT_OBJECT_DESTROY {
         if let Ok(mut state) = STATE.lock() {
-            if state.remove_window_internal(hwnd).is_some() {
+            if state.remove_window_internal(hwnd).is_some() || state.remove_window_internal(target_hwnd).is_some() {
                 LAYOUT_DIRTY.store(true, Ordering::Relaxed);
                 LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
                 WAKE_CONDVAR.notify_one();
@@ -725,12 +739,26 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    if event == EVENT_OBJECT_HIDE || event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_OBJECT_CLOAKED {
+    if event == EVENT_SYSTEM_MINIMIZESTART {
         if let Ok(mut state) = STATE.lock() {
-            if state.remove_window_internal(hwnd).is_some() {
+            if state.remove_window_internal(target_hwnd).is_some() {
                 LAYOUT_DIRTY.store(true, Ordering::Relaxed);
                 LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
                 WAKE_CONDVAR.notify_one();
+            }
+        }
+        return;
+    }
+
+    if event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_CLOAKED {
+        // Only remove window if it is genuinely no longer manageable (hidden, cloaked, minimized, or closed)
+        if !is_manageable(target_hwnd) {
+            if let Ok(mut state) = STATE.lock() {
+                if state.remove_window_internal(target_hwnd).is_some() {
+                    LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+                    LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                    WAKE_CONDVAR.notify_one();
+                }
             }
         }
         return;
@@ -738,7 +766,7 @@ unsafe extern "system" fn win_event_hook(
 
     if event == EVENT_SYSTEM_MOVESIZESTART {
         if let Ok(mut state) = STATE.lock() {
-            state.resizing_hwnd = Some(SendHwnd::new(hwnd));
+            state.resizing_hwnd = Some(SendHwnd::new(target_hwnd));
         }
         return;
     }
@@ -746,7 +774,7 @@ unsafe extern "system" fn win_event_hook(
     if event == EVENT_SYSTEM_MOVESIZEEND {
         if let Ok(mut state) = STATE.lock() {
             state.resizing_hwnd = None;
-            state.update_window_size(hwnd);
+            state.update_window_size(target_hwnd);
             LAYOUT_DIRTY.store(true, Ordering::Relaxed);
             LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
             WAKE_CONDVAR.notify_one();
@@ -754,22 +782,22 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    if !is_manageable(hwnd) {
+    if !is_manageable(target_hwnd) {
         return;
     }
 
     match event {
         EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE | EVENT_SYSTEM_MINIMIZEEND | EVENT_OBJECT_UNCLOAKED => {
             let added = if let Ok(mut state) = STATE.lock() {
-                state.add_window_internal(hwnd)
+                state.add_window_internal(target_hwnd)
             } else {
                 false
             };
             if added {
-                let is_fg = unsafe { GetForegroundWindow() == hwnd };
+                let is_fg = unsafe { GetForegroundWindow() == target_hwnd };
                 if is_fg {
                     if let Ok(mut state) = STATE.lock() {
-                        state.focus_window_offset(hwnd);
+                        state.focus_window_offset(target_hwnd);
                     }
                 }
                 LAYOUT_DIRTY.store(true, Ordering::Relaxed);
@@ -779,11 +807,11 @@ unsafe extern "system" fn win_event_hook(
         }
         EVENT_SYSTEM_FOREGROUND => {
             if let Ok(mut state) = STATE.lock() {
-                let added = state.add_window_internal(hwnd);
+                let added = state.add_window_internal(target_hwnd);
 
                 let lbutton_pressed = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } & 0x8000_u16 as i16 != 0;
                 if !lbutton_pressed {
-                    state.focus_window_offset(hwnd);
+                    state.focus_window_offset(target_hwnd);
                 }
 
                 if added {
@@ -809,6 +837,11 @@ unsafe extern "system" fn mouse_hook_proc(
         let is_shift = (shift_state as u16 & 0x8000) != 0;
 
         if is_alt {
+            if BLOCK_ALT_MENU.load(Ordering::Relaxed) {
+                keybd_event(0xE8, 0, KEYBD_EVENT_FLAGS(0), 0);
+                keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+            }
+
             let msll = *(lparam.0 as *const MSLLHOOKSTRUCT);
             let mouse_data = msll.mouseData;
             let delta = (mouse_data >> 16) as i16;
@@ -835,40 +868,62 @@ unsafe extern "system" fn keyboard_hook_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if ncode >= 0 && (wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN) {
-        let alt_state = GetAsyncKeyState(VK_MENU.0 as i32);
-        let is_alt = (alt_state as u16 & 0x8000) != 0;
+    if ncode >= 0 {
+        let msg = wparam.0 as u32;
+        let kbd = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let vk = kbd.vkCode;
 
-        if is_alt {
-            let kbd = *(lparam.0 as *const KBDLLHOOKSTRUCT);
-            let vk = kbd.vkCode;
-            let mut handled = false;
+        // Pass through our own injected mask key (0xE8)
+        if vk == 0xE8 {
+            return CallNextHookEx(None, ncode, wparam, lparam);
+        }
 
-            if vk == VK_LEFT.0 as u32 {
-                if let Ok(mut lock) = ACTIONS.lock() {
-                    lock.push(WmAction::MoveWindow(-1));
-                }
-                handled = true;
-            } else if vk == VK_RIGHT.0 as u32 {
-                if let Ok(mut lock) = ACTIONS.lock() {
-                    lock.push(WmAction::MoveWindow(1));
-                }
-                handled = true;
-            } else if vk == 0x53 { // 'S'
-                if let Ok(mut lock) = ACTIONS.lock() {
-                    lock.push(WmAction::ResizeWindow("cycle"));
-                }
-                handled = true;
-            } else if vk == 0x46 { // 'F'
-                if let Ok(mut lock) = ACTIONS.lock() {
-                    lock.push(WmAction::ResizeWindow("full"));
-                }
-                handled = true;
+        if BLOCK_ALT_MENU.load(Ordering::Relaxed) {
+            let is_alt_key = vk == VK_MENU.0 as u32 || vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32;
+            if is_alt_key && (msg == WM_KEYUP || msg == WM_SYSKEYUP) {
+                // Send dummy mask key before releasing Alt so Windows cancels menu bar activation
+                keybd_event(0xE8, 0, KEYBD_EVENT_FLAGS(0), 0);
+                keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
             }
+        }
 
-            if handled {
-                WAKE_CONDVAR.notify_one();
-                return LRESULT(1);
+        if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+            let alt_state = GetAsyncKeyState(VK_MENU.0 as i32);
+            let is_alt = (alt_state as u16 & 0x8000) != 0;
+
+            if is_alt {
+                let mut handled = false;
+
+                if vk == VK_LEFT.0 as u32 {
+                    if let Ok(mut lock) = ACTIONS.lock() {
+                        lock.push(WmAction::MoveWindow(-1));
+                    }
+                    handled = true;
+                } else if vk == VK_RIGHT.0 as u32 {
+                    if let Ok(mut lock) = ACTIONS.lock() {
+                        lock.push(WmAction::MoveWindow(1));
+                    }
+                    handled = true;
+                } else if vk == 0x53 { // 'S'
+                    if let Ok(mut lock) = ACTIONS.lock() {
+                        lock.push(WmAction::ResizeWindow("cycle"));
+                    }
+                    handled = true;
+                } else if vk == 0x46 { // 'F'
+                    if let Ok(mut lock) = ACTIONS.lock() {
+                        lock.push(WmAction::ResizeWindow("full"));
+                    }
+                    handled = true;
+                }
+
+                if handled {
+                    if BLOCK_ALT_MENU.load(Ordering::Relaxed) {
+                        keybd_event(0xE8, 0, KEYBD_EVENT_FLAGS(0), 0);
+                        keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+                    }
+                    WAKE_CONDVAR.notify_one();
+                    return LRESULT(1);
+                }
             }
         }
     }
@@ -1124,10 +1179,25 @@ mod tests {
         let config = WmConfig::default();
         assert!(config.enabled);
         assert!(config.smooth_scrolling);
+        assert!(config.block_alt_menu);
         assert_eq!(config.gap, 16);
         assert_eq!(config.scroll_speed, 100);
         assert_eq!(config.column_sizing_mode, "percent");
         assert_eq!(config.column_sizing_value, 50.0);
+    }
+
+    #[test]
+    fn test_set_config_updates_block_alt_menu() {
+        let mut config = WmConfig::default();
+        config.block_alt_menu = false;
+        set_config(config.clone());
+        assert!(!BLOCK_ALT_MENU.load(Ordering::Relaxed));
+        assert!(!get_config().block_alt_menu);
+
+        config.block_alt_menu = true;
+        set_config(config);
+        assert!(BLOCK_ALT_MENU.load(Ordering::Relaxed));
+        assert!(get_config().block_alt_menu);
     }
 
     #[test]
