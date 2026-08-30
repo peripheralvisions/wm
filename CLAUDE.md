@@ -10,7 +10,7 @@ Because the terminal sessions might not have `cargo` in the `$PATH` immediately 
 - **Add Shadcn UI components:** `npx shadcn@latest add <component-name>`
 
 ## Code Architecture
-This project is a Windows 11 tiling window manager mimicking the behavior of `niri-wm` (scrollable tiling). It is built with **Rust** (for low-level Windows API interactions) and **Tauri + React + Tailwind CSS + shadcn/ui** (for the configuration GUI and system tray).
+This project is a Windows 11 scrollable tiling window manager. It is built with **Rust** (for low-level Windows API interactions) and **Tauri + React + Tailwind CSS + shadcn/ui** (for the configuration GUI and system tray).
 
 ### Backend (Rust - `src-tauri/`)
 - Intercepts window lifecycle events (`EVENT_OBJECT_CREATE`, `EVENT_OBJECT_DESTROY`) using `SetWinEventHook`.

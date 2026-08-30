@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🪟 Niri-WM for Windows
+# 🪟 Scrollable Tiling WM for Windows
 
 ### *Infinite-Strip Scrollable Tiling Window Manager for Windows 11*
 
@@ -13,7 +13,7 @@
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue.svg?style=for-the-badge)](#-license)
 
 <p align="center">
-  <b>A modern, high-performance scrollable tiling window manager bringing the paradigm of <a href="https://github.com/YaLTeR/niri">niri</a> to Windows 11.</b>
+  <b>A modern, high-performance scrollable tiling window manager for Windows 11.</b>
   <br />
   Featuring an analytical spring physics engine, 144Hz+ precision frame pacing, universal browser sway elimination, and a sleek tray-based configuration dashboard.
 </p>
@@ -58,7 +58,7 @@
 ## 🚀 Key Features
 
 ### 🎛️ Scrollable Infinite Strip
-Unlike traditional grid or manual-tiling window managers (like i3, bspwm, or Komorebi) that compress windows into increasingly cramped columns, Niri-WM maintains readable, comfortable window widths on an expansive horizontal strip.
+Unlike traditional grid or manual-tiling window managers (like i3, bspwm, or Komorebi) that compress windows into increasingly cramped columns, this scrollable window manager maintains readable, comfortable window widths on an expansive horizontal strip.
 
 ### 🏎️ Dual-Phase Layout Pipeline
 | Layout Phase | Target Mechanism | Win32 Flags | Benefit |
@@ -164,7 +164,7 @@ The backend executes across three specialized operating system threads:
 
 ## ⚙️ GUI Configuration & System Tray
 
-Click the **Niri-WM** icon in your system tray to access the settings dashboard:
+Click the window manager icon in your system tray to access the settings dashboard:
 
 <div align="center">
 
@@ -243,13 +243,13 @@ The compiled binary and setup installer will be generated in:
 ## 🔍 Technical Deep Dive
 
 <details>
-<summary><b>Click to expand: How Niri-WM solves the Windows DWM Browser Sway problem</b></summary>
+<summary><b>Click to expand: How this window manager solves the Windows DWM Browser Sway problem</b></summary>
 
 ### The Problem
 When traditional window managers move applications like Google Chrome, Microsoft Edge, or Firefox at high framerates using standard `SetWindowPos`, the browsers' internal GPU rendering pipelines (such as WebRender or Viz) receive asynchronous `WM_WINDOWPOSCHANGING` and `WM_SIZE` messages. Because their swapchains render a few milliseconds out of phase with DWM compositing, the window contents appear to "sway", jitter, or lag behind the border frame during panning.
 
 ### The Solution
-Niri-WM implements an intelligent separation of concerns:
+The window manager implements an intelligent separation of concerns:
 1. **DWM Transitions Suppression**: Window-level DWM animation is forcefully disabled (`DWMWA_TRANSITIONS_FORCEDISABLED`) to eliminate OS-level interpolation delays.
 2. **Selective SWP Flags**: During translation-only frames, the engine passes `SWP_NOSIZE | SWP_NOREDRAW | SWP_DEFERERASE | SWP_NOSENDCHANGING | SWP_NOCOPYBITS`. This instructs the Windows subsystem to translate the existing top-level window surface directly without triggering redundant client invalidation or blocking the browser's render thread.
 3. **Discrete Integer Rasterization**: While the internal spring computes continuous floating-point coordinates ($f32$), screen commits are rounded to integer pixels with dirty-check caching (`last_rendered_int_offset`), preventing micro-stutter from subpixel rounding oscillation.
@@ -261,7 +261,7 @@ Niri-WM implements an intelligent separation of concerns:
 
 Windows 10 and 11 add invisible 7-8 pixel resizing borders around top-level windows (`rcWindow`). If a window manager positions windows using standard `GetWindowRect`, visible gaps will appear uneven.
 
-Niri-WM inspects `DwmGetWindowAttribute` with `DWMWA_EXTENDED_FRAME_BOUNDS` and computes exact margin differentials:
+The window manager inspects `DwmGetWindowAttribute` with `DWMWA_EXTENDED_FRAME_BOUNDS` and computes exact margin differentials:
 ```rust
 border_left   = bounds.left   - win_info.rcWindow.left;
 border_top    = bounds.top    - win_info.rcWindow.top;
@@ -275,7 +275,7 @@ These offsets are compensated in every layout calculation, resulting in uniform,
 
 ## 📋 Comparison
 
-| Feature | Niri-WM for Windows | Traditional Grid WMs (Komorebi, GlazeWM) | Windows Snap Layouts |
+| Feature | Scrollable Tiling WM | Traditional Grid WMs (Komorebi, GlazeWM) | Windows Snap Layouts |
 | :--- | :---: | :---: | :---: |
 | **Tiling Model** | **Infinite Horizontal Strip** | Fixed Screen Grid / Binary Tree | Static 2-4 Zones |
 | **Navigation** | **Smooth Spring Scroll / Snap** | Directional Focus Switch | Mouse / Win+Arrow |

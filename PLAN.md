@@ -1,7 +1,7 @@
-# Implementation Plan: Niri-style Window Manager for Windows 11
+# Implementation Plan: Scrollable Window Manager for Windows 11
 
 ## Context
-Build a modern tiling window manager for Windows 11 replicating `niri-wm` (scrollable-tiling Wayland compositor). Built with **Rust** (low-level Windows API) and **Tauri + React + Tailwind + shadcn/ui** (Configuration GUI).
+Build a modern tiling window manager for Windows 11 with scrollable tiling. Built with **Rust** (low-level Windows API) and **Tauri + React + Tailwind + shadcn/ui** (Configuration GUI).
 
 User requirements:
 - Mouse-oriented control.
@@ -10,7 +10,7 @@ User requirements:
 - Manual mouse resizing of individual windows.
 - Full workspace support.
 
-## 1. Niri-WM Paradigm & Core Mechanics
+## 1. Scrollable Tiling Paradigm & Core Mechanics
 **Scrollable Tiling:**
 - **Infinite Strip:** Windows arranged in columns on infinite horizontal strip.
 - **No Auto-Resizing:** New window appends column to right, existing windows do not shrink.
@@ -35,7 +35,7 @@ User requirements:
 ## 3. Mitigating Windows Resizing Artifacts & Issues
 
 1. **Gray Area Resizing Lag:**
-   - *Niri Advantage:* Moving windows (panning) doesn't trigger redraws.
+   - *Advantage:* Moving windows (panning) doesn't trigger redraws.
    - *Mouse-Driven Resizing:* OS handles render during drag. WM observes `MOVESIZEEND` and shifts neighbors.
    - *DWM Cloaking:* For programmatic resizes, use `DwmSetWindowAttribute` (`DWMWA_CLOAK`). Cloak -> resize -> wait -> uncloak.
    - *Batch Updates:* Use `DeferWindowPos` to batch position updates atomically.

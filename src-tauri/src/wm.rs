@@ -118,6 +118,8 @@ struct WmState {
 
 impl WmState {
     fn new() -> Self {
+        let config = load_config_from_disk();
+        BLOCK_ALT_MENU.store(config.block_alt_menu, Ordering::Relaxed);
         Self {
             windows: Vec::new(),
             current_offset_x: 0.0,
@@ -127,7 +129,7 @@ impl WmState {
             screen_y: 0,
             screen_width: 1920,
             screen_height: 1040,
-            config: WmConfig::default(),
+            config,
             resizing_hwnd: None,
             last_rendered_int_offset: i32::MIN,
         }
@@ -585,15 +587,49 @@ impl WmState {
     }
 }
 
+fn get_config_path() -> std::path::PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let mut p = std::path::PathBuf::from(appdata);
+        p.push("scrollable-wm");
+        p.push("config.json");
+        p
+    } else {
+        std::path::PathBuf::from("config.json")
+    }
+}
+
+pub fn load_config_from_disk() -> WmConfig {
+    let path = get_config_path();
+    if path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(config) = serde_json::from_str::<WmConfig>(&contents) {
+                return config;
+            }
+        }
+    }
+    WmConfig::default()
+}
+
+pub fn save_config_to_disk(config: &WmConfig) {
+    let path = get_config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
 pub fn get_config() -> WmConfig {
     if let Ok(state) = STATE.lock() {
         state.config.clone()
     } else {
-        WmConfig::default()
+        load_config_from_disk()
     }
 }
 
 pub fn set_config(config: WmConfig) {
+    save_config_to_disk(&config);
     BLOCK_ALT_MENU.store(config.block_alt_menu, Ordering::Relaxed);
     if let Ok(mut state) = STATE.lock() {
         state.config = config;
@@ -1198,6 +1234,23 @@ mod tests {
         set_config(config);
         assert!(BLOCK_ALT_MENU.load(Ordering::Relaxed));
         assert!(get_config().block_alt_menu);
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let mut config = WmConfig::default();
+        config.gap = 32;
+        config.scroll_speed = 150;
+        config.column_sizing_mode = "pixel".to_string();
+        config.column_sizing_value = 800.0;
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: WmConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.gap, 32);
+        assert_eq!(deserialized.scroll_speed, 150);
+        assert_eq!(deserialized.column_sizing_mode, "pixel");
+        assert_eq!(deserialized.column_sizing_value, 800.0);
     }
 
     #[test]
