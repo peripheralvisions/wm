@@ -91,6 +91,10 @@ struct ManagedWindow {
     border_top: i32,
     border_right: i32,
     border_bottom: i32,
+    last_x: i32,
+    last_y: i32,
+    last_w: i32,
+    last_h: i32,
 }
 
 struct WmState {
@@ -225,6 +229,10 @@ impl WmState {
             border_top,
             border_right,
             border_bottom,
+            last_x: i32::MIN,
+            last_y: i32::MIN,
+            last_w: 0,
+            last_h: 0,
         });
 
         true
@@ -306,7 +314,17 @@ impl WmState {
         self.last_rendered_int_offset = current_offset_int;
 
         unsafe {
+            // Prune dead windows to prevent invalid HWND retention and offset drift
+            self.windows.retain(|w| IsWindow(Some(w.hwnd.get())).as_bool());
+
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
+
+            // Viewport culling bounds: active screen + 1 full screen width buffer on each side.
+            // Generous buffer ensures windows entering the viewport are pre-positioned
+            // hundreds of pixels before becoming visible, preventing pop-in and Chromium sway.
+            let cull_margin = self.screen_width.max(1200);
+            let active_left = self.screen_x - cull_margin;
+            let active_right = self.screen_x + self.screen_width + cull_margin;
 
             if size_changed {
                 let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
@@ -316,7 +334,7 @@ impl WmState {
                     _ => None,
                 };
 
-                for w in &self.windows {
+                for w in &mut self.windows {
                     let hwnd = w.hwnd.get();
 
                     if let Some(ref resizing) = self.resizing_hwnd {
@@ -333,42 +351,53 @@ impl WmState {
                         + w.border_top
                         + w.border_bottom;
 
-                    if let Some(h) = hdwp {
-                        match DeferWindowPos(
-                            h,
-                            hwnd,
-                            Some(HWND::default()),
-                            target_x,
-                            target_y,
-                            target_w,
-                            target_h,
-                            flags,
-                        ) {
-                            Ok(new_h) if !new_h.is_invalid() => {
-                                hdwp = Some(new_h);
+                    let in_active_range = (target_x + target_w >= active_left) && (target_x <= active_right);
+                    let was_active = (w.last_x + w.last_w >= active_left) && (w.last_x <= active_right);
+                    let needs_update = in_active_range || was_active || w.last_x == i32::MIN;
+
+                    if needs_update {
+                        if let Some(h) = hdwp {
+                            match DeferWindowPos(
+                                h,
+                                hwnd,
+                                Some(HWND::default()),
+                                target_x,
+                                target_y,
+                                target_w,
+                                target_h,
+                                flags,
+                            ) {
+                                Ok(new_h) if !new_h.is_invalid() => {
+                                    hdwp = Some(new_h);
+                                }
+                                _ => {
+                                    let _ = SetWindowPos(
+                                        hwnd,
+                                        Some(HWND::default()),
+                                        target_x,
+                                        target_y,
+                                        target_w,
+                                        target_h,
+                                        flags,
+                                    );
+                                }
                             }
-                            _ => {
-                                let _ = SetWindowPos(
-                                    hwnd,
-                                    Some(HWND::default()),
-                                    target_x,
-                                    target_y,
-                                    target_w,
-                                    target_h,
-                                    flags,
-                                );
-                            }
+                        } else {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND::default()),
+                                target_x,
+                                target_y,
+                                target_w,
+                                target_h,
+                                flags,
+                            );
                         }
-                    } else {
-                        let _ = SetWindowPos(
-                            hwnd,
-                            Some(HWND::default()),
-                            target_x,
-                            target_y,
-                            target_w,
-                            target_h,
-                            flags,
-                        );
+
+                        w.last_x = target_x;
+                        w.last_y = target_y;
+                        w.last_w = target_w;
+                        w.last_h = target_h;
                     }
 
                     current_x += w.width + self.config.gap;
@@ -386,7 +415,7 @@ impl WmState {
                     | SWP_NOREDRAW
                     | SWP_DEFERERASE;
 
-                for w in &self.windows {
+                for w in &mut self.windows {
                     let hwnd = w.hwnd.get();
 
                     if let Some(ref resizing) = self.resizing_hwnd {
@@ -403,15 +432,26 @@ impl WmState {
                         + w.border_top
                         + w.border_bottom;
 
-                    let _ = SetWindowPos(
-                        hwnd,
-                        Some(HWND::default()),
-                        target_x,
-                        target_y,
-                        target_w,
-                        target_h,
-                        flags,
-                    );
+                    let in_active_range = (target_x + target_w >= active_left) && (target_x <= active_right);
+                    let was_active = (w.last_x + w.last_w >= active_left) && (w.last_x <= active_right);
+
+                    if in_active_range || was_active || w.last_x == i32::MIN {
+                        if target_x != w.last_x || target_y != w.last_y || w.last_x == i32::MIN {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND::default()),
+                                target_x,
+                                target_y,
+                                target_w,
+                                target_h,
+                                flags,
+                            );
+                            w.last_x = target_x;
+                            w.last_y = target_y;
+                            w.last_w = target_w;
+                            w.last_h = target_h;
+                        }
+                    }
 
                     current_x += w.width + self.config.gap;
                 }
@@ -1158,6 +1198,10 @@ mod tests {
             border_top: 0,
             border_right: 0,
             border_bottom: 0,
+            last_x: i32::MIN,
+            last_y: i32::MIN,
+            last_w: 0,
+            last_h: 0,
         });
         // total_width = gap (16) + (900 + 16) = 932 <= 1920 -> max_offset = 0
         assert_eq!(state.max_offset(), 0);
@@ -1170,6 +1214,10 @@ mod tests {
             border_top: 0,
             border_right: 0,
             border_bottom: 0,
+            last_x: i32::MIN,
+            last_y: i32::MIN,
+            last_w: 0,
+            last_h: 0,
         });
         state.windows.push(ManagedWindow {
             hwnd: SendHwnd(3),
@@ -1178,9 +1226,42 @@ mod tests {
             border_top: 0,
             border_right: 0,
             border_bottom: 0,
+            last_x: i32::MIN,
+            last_y: i32::MIN,
+            last_w: 0,
+            last_h: 0,
         });
         // total_width = 16 + (900+16)*3 = 16 + 2748 = 2764
         // max_offset = 2764 - 1920 = 844
         assert_eq!(state.max_offset(), 844);
+    }
+
+    #[test]
+    fn test_multi_window_focus_offset() {
+        let mut state = WmState::new();
+        state.screen_width = 1920;
+        state.config.gap = 16;
+
+        for i in 0..10 {
+            state.windows.push(ManagedWindow {
+                hwnd: SendHwnd(i + 1),
+                width: 960,
+                border_left: 0,
+                border_top: 0,
+                border_right: 0,
+                border_bottom: 0,
+                last_x: i32::MIN,
+                last_y: i32::MIN,
+                last_w: 0,
+                last_h: 0,
+            });
+        }
+
+        // Focus 5th window (index 4, hwnd 5)
+        // window_left = 4 * (960 + 16) = 3904
+        // center_x = 3904 + 480 = 4384
+        // target_offset_x = 4384 - 1920/2 = 3424
+        state.focus_window_offset(HWND(5 as *mut _));
+        assert_eq!(state.target_offset_x, 3424.0);
     }
 }
