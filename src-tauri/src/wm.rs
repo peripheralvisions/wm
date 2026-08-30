@@ -326,142 +326,106 @@ impl WmState {
 
             let mut current_x = self.screen_x + self.config.gap - current_offset_int;
 
-            // Viewport culling bounds: active screen + 1 full screen width buffer on each side.
-            // Generous buffer ensures windows entering the viewport are pre-positioned
-            // hundreds of pixels before becoming visible, preventing pop-in and Chromium sway.
-            let cull_margin = self.screen_width.max(1200);
+            // Viewport culling bounds: active screen + tight 300px buffer on each side.
+            // 300px guarantees windows are pre-positioned before entering view,
+            // while completely avoiding heavy DWM composition on far off-screen windows.
+            let cull_margin = 300;
             let active_left = self.screen_x - cull_margin;
             let active_right = self.screen_x + self.screen_width + cull_margin;
 
-            if size_changed {
-                let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
-                let window_count = self.windows.len() as i32;
-                let mut hdwp = match BeginDeferWindowPos(window_count) {
-                    Ok(h) if !h.is_invalid() => Some(h),
-                    _ => None,
-                };
-
-                for w in &mut self.windows {
-                    let hwnd = w.hwnd.get();
-
-                    if let Some(ref resizing) = self.resizing_hwnd {
-                        if resizing.0 == w.hwnd.0 {
-                            current_x += w.width + self.config.gap;
-                            continue;
-                        }
-                    }
-
-                    let target_x = current_x - w.border_left;
-                    let target_y = self.screen_y + self.config.gap - w.border_top;
-                    let target_w = w.width + w.border_left + w.border_right;
-                    let target_h = (self.screen_height - self.config.gap * 2)
-                        + w.border_top
-                        + w.border_bottom;
-
-                    let in_active_range = (target_x + target_w >= active_left) && (target_x <= active_right);
-                    let was_active = (w.last_x + w.last_w >= active_left) && (w.last_x <= active_right);
-                    let needs_update = in_active_range || was_active || w.last_x == i32::MIN;
-
-                    if needs_update {
-                        if let Some(h) = hdwp {
-                            match DeferWindowPos(
-                                h,
-                                hwnd,
-                                Some(HWND::default()),
-                                target_x,
-                                target_y,
-                                target_w,
-                                target_h,
-                                flags,
-                            ) {
-                                Ok(new_h) if !new_h.is_invalid() => {
-                                    hdwp = Some(new_h);
-                                }
-                                _ => {
-                                    let _ = SetWindowPos(
-                                        hwnd,
-                                        Some(HWND::default()),
-                                        target_x,
-                                        target_y,
-                                        target_w,
-                                        target_h,
-                                        flags,
-                                    );
-                                }
-                            }
-                        } else {
-                            let _ = SetWindowPos(
-                                hwnd,
-                                Some(HWND::default()),
-                                target_x,
-                                target_y,
-                                target_w,
-                                target_h,
-                                flags,
-                            );
-                        }
-
-                        w.last_x = target_x;
-                        w.last_y = target_y;
-                        w.last_w = target_w;
-                        w.last_h = target_h;
-                    }
-
-                    current_x += w.width + self.config.gap;
-                }
-
-                if let Some(h) = hdwp {
-                    let _ = EndDeferWindowPos(h);
-                }
+            let flags = if size_changed {
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS
             } else {
-                let flags = SWP_NOZORDER
+                SWP_NOZORDER
                     | SWP_NOACTIVATE
                     | SWP_NOSENDCHANGING
                     | SWP_NOSIZE
-                    | SWP_NOCOPYBITS
                     | SWP_NOREDRAW
-                    | SWP_DEFERERASE;
+                    | SWP_DEFERERASE
+            };
 
-                for w in &mut self.windows {
-                    let hwnd = w.hwnd.get();
+            let window_count = self.windows.len() as i32;
+            let mut hdwp = match BeginDeferWindowPos(window_count) {
+                Ok(h) if !h.is_invalid() => Some(h),
+                _ => None,
+            };
 
-                    if let Some(ref resizing) = self.resizing_hwnd {
-                        if resizing.0 == w.hwnd.0 {
-                            current_x += w.width + self.config.gap;
-                            continue;
-                        }
+            for w in &mut self.windows {
+                let hwnd = w.hwnd.get();
+
+                if let Some(ref resizing) = self.resizing_hwnd {
+                    if resizing.0 == w.hwnd.0 {
+                        current_x += w.width + self.config.gap;
+                        continue;
                     }
-
-                    let target_x = current_x - w.border_left;
-                    let target_y = self.screen_y + self.config.gap - w.border_top;
-                    let target_w = w.width + w.border_left + w.border_right;
-                    let target_h = (self.screen_height - self.config.gap * 2)
-                        + w.border_top
-                        + w.border_bottom;
-
-                    let in_active_range = (target_x + target_w >= active_left) && (target_x <= active_right);
-                    let was_active = (w.last_x + w.last_w >= active_left) && (w.last_x <= active_right);
-
-                    if in_active_range || was_active || w.last_x == i32::MIN {
-                        if target_x != w.last_x || target_y != w.last_y || w.last_x == i32::MIN {
-                            let _ = SetWindowPos(
-                                hwnd,
-                                Some(HWND::default()),
-                                target_x,
-                                target_y,
-                                target_w,
-                                target_h,
-                                flags,
-                            );
-                            w.last_x = target_x;
-                            w.last_y = target_y;
-                            w.last_w = target_w;
-                            w.last_h = target_h;
-                        }
-                    }
-
-                    current_x += w.width + self.config.gap;
                 }
+
+                let target_x = current_x - w.border_left;
+                let target_y = self.screen_y + self.config.gap - w.border_top;
+                let target_w = w.width + w.border_left + w.border_right;
+                let target_h = (self.screen_height - self.config.gap * 2)
+                    + w.border_top
+                    + w.border_bottom;
+
+                let in_active_range = (target_x + target_w >= active_left) && (target_x <= active_right);
+                let was_active = (w.last_x + w.last_w >= active_left) && (w.last_x <= active_right);
+                let needs_update = if size_changed {
+                    in_active_range || was_active || w.last_x == i32::MIN
+                } else {
+                    (in_active_range || was_active || w.last_x == i32::MIN)
+                        && (target_x != w.last_x || target_y != w.last_y || w.last_x == i32::MIN)
+                };
+
+                if needs_update {
+                    if let Some(h) = hdwp {
+                        match DeferWindowPos(
+                            h,
+                            hwnd,
+                            Some(HWND::default()),
+                            target_x,
+                            target_y,
+                            target_w,
+                            target_h,
+                            flags,
+                        ) {
+                            Ok(new_h) if !new_h.is_invalid() => {
+                                hdwp = Some(new_h);
+                            }
+                            _ => {
+                                let _ = SetWindowPos(
+                                    hwnd,
+                                    Some(HWND::default()),
+                                    target_x,
+                                    target_y,
+                                    target_w,
+                                    target_h,
+                                    flags,
+                                );
+                            }
+                        }
+                    } else {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            Some(HWND::default()),
+                            target_x,
+                            target_y,
+                            target_w,
+                            target_h,
+                            flags,
+                        );
+                    }
+
+                    w.last_x = target_x;
+                    w.last_y = target_y;
+                    w.last_w = target_w;
+                    w.last_h = target_h;
+                }
+
+                current_x += w.width + self.config.gap;
+            }
+
+            if let Some(h) = hdwp {
+                let _ = EndDeferWindowPos(h);
             }
         }
         true
@@ -755,6 +719,22 @@ unsafe extern "system" fn win_event_hook(
 ) {
     if idobject != OBJID_WINDOW.0 || idchild != 0 {
         return;
+    }
+
+    // Fast-reject any event outside the specific window lifecycle events we manage
+    match event {
+        EVENT_OBJECT_DESTROY
+        | EVENT_SYSTEM_MINIMIZESTART
+        | EVENT_OBJECT_HIDE
+        | EVENT_OBJECT_CLOAKED
+        | EVENT_SYSTEM_MOVESIZESTART
+        | EVENT_SYSTEM_MOVESIZEEND
+        | EVENT_OBJECT_SHOW
+        | EVENT_OBJECT_CREATE
+        | EVENT_SYSTEM_MINIMIZEEND
+        | EVENT_OBJECT_UNCLOAKED
+        | EVENT_SYSTEM_FOREGROUND => {}
+        _ => return,
     }
 
     let root_hwnd = GetAncestor(hwnd, GA_ROOT);
@@ -1086,19 +1066,17 @@ pub fn start_wm() {
             }
 
             if is_animating {
-                next_frame_time += frame_duration;
                 let cur = Instant::now();
                 if next_frame_time > cur {
                     let remaining = next_frame_time - cur;
-                    if remaining > Duration::from_millis(3) {
-                        thread::sleep(remaining - Duration::from_millis(2));
+                    if remaining > Duration::from_millis(2) {
+                        thread::sleep(remaining - Duration::from_millis(1));
                     }
                     while Instant::now() < next_frame_time {
                         std::hint::spin_loop();
                     }
-                } else if cur.duration_since(next_frame_time) > frame_duration * 2 {
-                    next_frame_time = cur;
                 }
+                next_frame_time = Instant::now() + frame_duration;
             } else {
                 if let Ok(lock) = WAKE_MUTEX.lock() {
                     let actions_empty = ACTIONS.lock().map(|a| a.is_empty()).unwrap_or(true);
@@ -1154,6 +1132,16 @@ pub fn start_wm() {
 
             let win_hook_object = SetWinEventHook(
                 EVENT_OBJECT_CREATE,
+                EVENT_OBJECT_HIDE,
+                None,
+                Some(win_event_hook),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+
+            let win_hook_cloak = SetWinEventHook(
+                EVENT_OBJECT_CLOAKED,
                 EVENT_OBJECT_UNCLOAKED,
                 None,
                 Some(win_event_hook),
@@ -1199,6 +1187,7 @@ pub fn start_wm() {
             }
 
             let _ = UnhookWinEvent(win_hook_object);
+            let _ = UnhookWinEvent(win_hook_cloak);
             let _ = UnhookWinEvent(win_hook_minimize);
             let _ = UnhookWinEvent(win_hook_movesize);
             let _ = UnhookWinEvent(win_hook_foreground);
