@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
@@ -20,13 +19,14 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVE
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MENU, VK_SHIFT, VK_LEFT, VK_RIGHT};
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CallNextHookEx, DeferWindowPos,
-    DispatchMessageW, EndDeferWindowPos, EnumWindows, GetClassNameW, GetForegroundWindow,
-    GetMessageW, GetParent, GetWindowInfo, GetWindowLongW, GetWindowThreadProcessId,
-    IsWindowVisible, SetWindowPos, SetWindowsHookExW, SystemParametersInfoW,
+    DispatchMessageW, EndDeferWindowPos, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetMessageW, GetWindowInfo, GetWindowLongW, GetWindowThreadProcessId,
+    IsWindow, IsWindowVisible, SetWindowPos, SetWindowsHookExW, SystemParametersInfoW,
     TranslateMessage, UnhookWindowsHookEx,
-    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW,
+    EVENT_OBJECT_CLOAKED, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_SHOW, EVENT_OBJECT_UNCLOAKED,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
-    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE, GWL_STYLE, MSG,
+    EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, MSG,
     MSLLHOOKSTRUCT, OBJID_WINDOW, SPI_GETWORKAREA,
     SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_NOREDRAW, SWP_DEFERERASE,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -581,13 +581,10 @@ static LAYOUT_SIZE_CHANGED: AtomicBool = AtomicBool::new(false);
 static WAKE_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 static WAKE_CONDVAR: Lazy<Condvar> = Lazy::new(Condvar::new);
 
-// Cache of HWNDs that failed is_manageable()
-static REJECTED_CACHE: Lazy<Mutex<HashSet<isize>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-
-fn is_manageable(hwnd: HWND) -> (bool, bool) {
+fn is_manageable(hwnd: HWND) -> bool {
     unsafe {
-        if hwnd.0.is_null() {
-            return (false, true);
+        if hwnd.0.is_null() || !IsWindow(Some(hwnd)).as_bool() {
+            return false;
         }
 
         let mut cloaked = 0u32;
@@ -600,7 +597,7 @@ fn is_manageable(hwnd: HWND) -> (bool, bool) {
         .is_ok()
         {
             if cloaked != 0 {
-                return (false, false);
+                return false;
             }
         }
 
@@ -608,33 +605,28 @@ fn is_manageable(hwnd: HWND) -> (bool, bool) {
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
         if style & WS_CHILD.0 != 0 {
-            return (false, true);
+            return false;
+        }
+
+        if GetAncestor(hwnd, GA_ROOT) != hwnd {
+            return false;
         }
 
         if (ex_style & WS_EX_TOOLWINDOW.0 != 0) && (ex_style & WS_EX_APPWINDOW.0 == 0) {
-            return (false, true);
-        }
-
-        if let Ok(parent) = GetParent(hwnd) {
-            if !parent.is_invalid()
-                && parent.0 != std::ptr::null_mut()
-                && (ex_style & WS_EX_APPWINDOW.0 == 0)
-            {
-                return (false, true);
-            }
+            return false;
         }
 
         if (style & WS_POPUP.0 != 0)
             && (style & (WS_THICKFRAME.0 | WS_CAPTION.0) == 0)
             && (ex_style & WS_EX_APPWINDOW.0 == 0)
         {
-            return (false, true);
+            return false;
         }
 
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         if pid == 0 || pid == std::process::id() {
-            return (false, true);
+            return false;
         }
 
         let mut buf = [0u16; 256];
@@ -654,19 +646,19 @@ fn is_manageable(hwnd: HWND) -> (bool, bool) {
         ];
 
         if ignored_classes.contains(&class_name.as_str()) {
-            return (false, true);
+            return false;
         }
 
         // Dynamic checks evaluated last
         if !IsWindowVisible(hwnd).as_bool() {
-            return (false, false);
+            return false;
         }
 
         if style & WS_MINIMIZE.0 != 0 {
-            return (false, false);
+            return false;
         }
     }
-    (true, false)
+    true
 }
 
 unsafe extern "system" fn win_event_hook(
@@ -683,19 +675,17 @@ unsafe extern "system" fn win_event_hook(
     }
 
     if event == EVENT_OBJECT_DESTROY {
-        if let Ok(mut cache) = REJECTED_CACHE.lock() {
-            cache.remove(&(hwnd.0 as isize));
-        }
         if let Ok(mut state) = STATE.lock() {
-            state.remove_window_internal(hwnd);
+            if state.remove_window_internal(hwnd).is_some() {
+                LAYOUT_DIRTY.store(true, Ordering::Relaxed);
+                LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
+                WAKE_CONDVAR.notify_one();
+            }
         }
-        LAYOUT_DIRTY.store(true, Ordering::Relaxed);
-        LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
-        WAKE_CONDVAR.notify_one();
         return;
     }
 
-    if event == EVENT_OBJECT_HIDE || event == EVENT_SYSTEM_MINIMIZESTART {
+    if event == EVENT_OBJECT_HIDE || event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_OBJECT_CLOAKED {
         if let Ok(mut state) = STATE.lock() {
             if state.remove_window_internal(hwnd).is_some() {
                 LAYOUT_DIRTY.store(true, Ordering::Relaxed);
@@ -724,25 +714,12 @@ unsafe extern "system" fn win_event_hook(
         return;
     }
 
-    let hwnd_key = hwnd.0 as isize;
-    if let Ok(cache) = REJECTED_CACHE.lock() {
-        if cache.contains(&hwnd_key) {
-            return;
-        }
-    }
-
-    let (manageable, permanent_reject) = is_manageable(hwnd);
-    if !manageable {
-        if permanent_reject {
-            if let Ok(mut cache) = REJECTED_CACHE.lock() {
-                cache.insert(hwnd_key);
-            }
-        }
+    if !is_manageable(hwnd) {
         return;
     }
 
     match event {
-        EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE | EVENT_SYSTEM_MINIMIZEEND => {
+        EVENT_OBJECT_SHOW | EVENT_OBJECT_CREATE | EVENT_SYSTEM_MINIMIZEEND | EVENT_OBJECT_UNCLOAKED => {
             let added = if let Ok(mut state) = STATE.lock() {
                 state.add_window_internal(hwnd)
             } else {
@@ -872,7 +849,7 @@ fn get_refresh_rate() -> u32 {
 }
 
 unsafe extern "system" fn enum_windows_proc(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
-    if is_manageable(hwnd).0 {
+    if is_manageable(hwnd) {
         if let Ok(mut state) = STATE.lock() {
             state.add_window_internal(hwnd);
         }
@@ -1044,19 +1021,9 @@ pub fn start_wm() {
             LAYOUT_SIZE_CHANGED.store(true, Ordering::Relaxed);
             WAKE_CONDVAR.notify_one();
 
-            let win_hook_create_destroy = SetWinEventHook(
-                EVENT_OBJECT_SHOW,
-                EVENT_OBJECT_HIDE,
-                None,
-                Some(win_event_hook),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-            );
-
-            let win_hook_create = SetWinEventHook(
+            let win_hook_object = SetWinEventHook(
                 EVENT_OBJECT_CREATE,
-                EVENT_OBJECT_DESTROY,
+                EVENT_OBJECT_UNCLOAKED,
                 None,
                 Some(win_event_hook),
                 0,
@@ -1100,8 +1067,7 @@ pub fn start_wm() {
                 let _ = DispatchMessageW(&msg);
             }
 
-            let _ = UnhookWinEvent(win_hook_create_destroy);
-            let _ = UnhookWinEvent(win_hook_create);
+            let _ = UnhookWinEvent(win_hook_object);
             let _ = UnhookWinEvent(win_hook_minimize);
             let _ = UnhookWinEvent(win_hook_movesize);
             let _ = UnhookWinEvent(win_hook_foreground);
