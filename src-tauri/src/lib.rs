@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod wm;
+pub mod layout_engine;
 
 use tauri::{
     menu::{Menu, MenuItem},
