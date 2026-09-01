@@ -9,6 +9,7 @@ interface LayoutPreviewProps {
   columnSizingValue: number;
   smoothScrolling: boolean;
   snapToWindow: boolean;
+  snapSpeed?: number;
 }
 
 interface MockWindow {
@@ -33,9 +34,14 @@ export function LayoutPreview({
   columnSizingValue,
   smoothScrolling,
   snapToWindow,
+  snapSpeed,
 }: LayoutPreviewProps) {
   const [scrollIndex, setScrollIndex] = useState(1);
   const [activeWindowId, setActiveWindowId] = useState("browser");
+
+  const speed = snapSpeed ?? 35;
+  // Map snapSpeed (10 to 100) to transition duration: 10 -> 500ms (slow glide), 35 -> 280ms (smooth), 100 -> 100ms (snappy)
+  const animDuration = Math.round(550 - (Math.min(100, Math.max(10, speed)) / 100) * 450);
 
   // Calculate proportional visual values for preview container (container is ~500px wide viewport)
   // Real gap is 0-128px; in preview scale down to ~0-32px
@@ -126,11 +132,12 @@ export function LayoutPreview({
         {/* Scrollable Window Strip */}
         <div
           className={`absolute top-8 bottom-3 left-3 right-3 flex items-center ${
-            smoothScrolling ? "transition-transform duration-300 ease-out" : "transition-none"
+            smoothScrolling ? "transition-transform ease-out" : "transition-none"
           }`}
           style={{
             transform: `translateX(calc(${50 - windowWidthPercent / 2}% - ${totalOffsetPercent}%))`,
             gap: `${visualGap}px`,
+            transitionDuration: smoothScrolling ? `${animDuration}ms` : "0ms",
           }}
         >
           {MOCK_WINDOWS.map((win, idx) => {

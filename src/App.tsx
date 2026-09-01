@@ -39,6 +39,7 @@ interface WmConfig {
   gap: number;
   scroll_speed: number;
   snap_to_window: boolean;
+  snap_speed: number;
   column_sizing_mode: string;
   column_sizing_value: number;
   smooth_scrolling: boolean;
@@ -50,6 +51,7 @@ const DEFAULT_CONFIG: WmConfig = {
   gap: 16,
   scroll_speed: 100,
   snap_to_window: false,
+  snap_speed: 35,
   column_sizing_mode: "percent",
   column_sizing_value: 50.0,
   smooth_scrolling: true,
@@ -423,6 +425,7 @@ export function App() {
                 columnSizingValue={config.column_sizing_value}
                 smoothScrolling={config.smooth_scrolling}
                 snapToWindow={config.snap_to_window}
+                snapSpeed={config.snap_speed}
               />
             )}
 
@@ -627,6 +630,53 @@ export function App() {
                     checked={config.snap_to_window}
                     onCheckedChange={(v) => setConfig({ ...config, snap_to_window: v })}
                   />
+                </div>
+
+                <Separator />
+
+                {/* Snap Speed / Motion Responsiveness Setting */}
+                <div
+                  className={`space-y-3 transition-opacity ${
+                    !config.smooth_scrolling ? "opacity-40 pointer-events-none" : "opacity-100"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <Label className="text-sm font-medium">Snap & Motion Speed</Label>
+                        <Badge variant="outline" className="text-[10px]">
+                          {config.snap_speed <= 20
+                            ? "Slow & Gentle"
+                            : config.snap_speed <= 40
+                            ? "Smooth & Balanced"
+                            : config.snap_speed <= 65
+                            ? "Responsive"
+                            : "Snappy"}
+                        </Badge>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Control how snappy or smooth window snapping, panning, and focus transitions feel.
+                      </p>
+                    </div>
+                    <Badge variant="secondary" className="font-mono text-xs">
+                      {config.snap_speed}
+                    </Badge>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-xs text-muted-foreground">
+                      <span>Slower / Gentle (10)</span>
+                      <span>Default (35)</span>
+                      <span>Snappy (100)</span>
+                    </div>
+                    <Slider
+                      value={[config.snap_speed]}
+                      onValueChange={(v) => setConfig({ ...config, snap_speed: v[0] })}
+                      min={10}
+                      max={100}
+                      step={5}
+                      className="py-1"
+                    />
+                  </div>
                 </div>
 
                 <Separator />

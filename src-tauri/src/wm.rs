@@ -47,12 +47,18 @@ pub enum WmAction {
 
 pub static ACTIONS: Lazy<Mutex<Vec<WmAction>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
+fn default_snap_speed() -> i32 {
+    35
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WmConfig {
     pub enabled: bool,
     pub gap: i32,
     pub scroll_speed: i32,
     pub snap_to_window: bool,
+    #[serde(default = "default_snap_speed")]
+    pub snap_speed: i32,
     pub column_sizing_mode: String,
     pub column_sizing_value: f32,
     pub smooth_scrolling: bool,
@@ -66,6 +72,7 @@ impl Default for WmConfig {
             gap: 16,
             scroll_speed: 100,
             snap_to_window: false,
+            snap_speed: 35,
             column_sizing_mode: "percent".to_string(),
             column_sizing_value: 50.0,
             smooth_scrolling: true,
@@ -140,7 +147,7 @@ impl WmState {
     /// Returns true if still animating.
     fn step_spring(&mut self, omega: f32, dt: f32) -> bool {
         let diff = self.current_offset_x - self.target_offset_x;
-        if diff.abs() < 0.5 && self.offset_velocity_x.abs() < 10.0 {
+        if diff.abs() < 0.25 && self.offset_velocity_x.abs() < 5.0 {
             self.current_offset_x = self.target_offset_x;
             self.offset_velocity_x = 0.0;
             return false;
@@ -151,7 +158,7 @@ impl WmState {
         self.current_offset_x = self.target_offset_x + (diff + temp) * exp;
         self.offset_velocity_x = (self.offset_velocity_x - omega * temp) * exp;
 
-        if (self.current_offset_x - self.target_offset_x).abs() < 0.5 && self.offset_velocity_x.abs() < 10.0 {
+        if (self.current_offset_x - self.target_offset_x).abs() < 0.25 && self.offset_velocity_x.abs() < 5.0 {
             self.current_offset_x = self.target_offset_x;
             self.offset_velocity_x = 0.0;
             false
@@ -437,12 +444,13 @@ impl WmState {
         }
 
         if self.config.snap_to_window {
-            let direction = if delta > 0 { -1 } else { 1 };
+            let steps = ((delta as f32 / 120.0).round() as i32).abs().max(1);
+            let direction = if delta > 0 { -steps } else { steps };
 
             let mut nearest_idx = 0;
             let mut min_dist = i32::MAX;
 
-            let mut acc_x = 0;
+            let mut acc_x = self.config.gap;
             for (i, w) in self.windows.iter().enumerate() {
                 let center_x = acc_x + w.width / 2;
                 let view_center = self.target_offset_x as i32 + self.screen_width / 2;
@@ -458,7 +466,7 @@ impl WmState {
                 (nearest_idx as i32 + direction).clamp(0, (self.windows.len() as i32 - 1).max(0))
                     as usize;
 
-            let mut target_acc_x = 0;
+            let mut target_acc_x = self.config.gap;
             for (i, w) in self.windows.iter().enumerate() {
                 if i == target_idx {
                     let center_x = target_acc_x + w.width / 2;
@@ -485,7 +493,7 @@ impl WmState {
             return;
         }
         let shwnd = SendHwnd::new(hwnd);
-        let mut acc_x = 0;
+        let mut acc_x = self.config.gap;
         for w in &self.windows {
             if w.hwnd == shwnd {
                 let window_left = acc_x;
@@ -1026,15 +1034,20 @@ pub fn start_wm() {
 
                 if state.config.enabled && state.config.smooth_scrolling {
                     if state.resizing_hwnd.is_none() {
-                        let spring_active = state.step_spring(85.0, dt);
+                        let omega = (state.config.snap_speed as f32).clamp(10.0, 150.0);
+                        let spring_active = state.step_spring(omega, dt);
 
                         if spring_active {
                             is_animating = true;
                             state.apply_layout(false);
-                        } else if state.current_offset_x != state.target_offset_x {
-                            state.current_offset_x = state.target_offset_x;
-                            state.offset_velocity_x = 0.0;
-                            state.apply_layout(true);
+                        } else {
+                            if state.current_offset_x != state.target_offset_x {
+                                state.current_offset_x = state.target_offset_x;
+                                state.offset_velocity_x = 0.0;
+                                state.apply_layout(true);
+                            } else if state.current_offset_x.round() as i32 != state.last_rendered_int_offset {
+                                state.apply_layout(false);
+                            }
                         }
                         factor_used = state.offset_velocity_x;
                     }
@@ -1207,6 +1220,7 @@ mod tests {
         assert!(config.block_alt_menu);
         assert_eq!(config.gap, 16);
         assert_eq!(config.scroll_speed, 100);
+        assert_eq!(config.snap_speed, 35);
         assert_eq!(config.column_sizing_mode, "percent");
         assert_eq!(config.column_sizing_value, 50.0);
     }
@@ -1230,6 +1244,7 @@ mod tests {
         let mut config = WmConfig::default();
         config.gap = 32;
         config.scroll_speed = 150;
+        config.snap_speed = 50;
         config.column_sizing_mode = "pixel".to_string();
         config.column_sizing_value = 800.0;
 
@@ -1238,8 +1253,26 @@ mod tests {
 
         assert_eq!(deserialized.gap, 32);
         assert_eq!(deserialized.scroll_speed, 150);
+        assert_eq!(deserialized.snap_speed, 50);
         assert_eq!(deserialized.column_sizing_mode, "pixel");
         assert_eq!(deserialized.column_sizing_value, 800.0);
+    }
+
+    #[test]
+    fn test_config_deserialization_backwards_compatibility() {
+        // Test json without snap_speed field (from older app version)
+        let json = r#"{
+            "enabled": true,
+            "gap": 16,
+            "scroll_speed": 100,
+            "snap_to_window": false,
+            "column_sizing_mode": "percent",
+            "column_sizing_value": 50.0,
+            "smooth_scrolling": true,
+            "block_alt_menu": true
+        }"#;
+        let deserialized: WmConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(deserialized.snap_speed, 35);
     }
 
     #[test]
@@ -1250,11 +1283,11 @@ mod tests {
         state.offset_velocity_x = 0.0;
 
         let dt = 1.0 / 144.0; // 144 Hz frame time (~6.94ms)
-        let omega = 85.0;
+        let omega = 35.0; // Balanced smooth snap speed
         let mut frames = 0;
         let mut animating = true;
 
-        while animating && frames < 60 {
+        while animating && frames < 120 {
             animating = state.step_spring(omega, dt);
             frames += 1;
 
@@ -1266,10 +1299,10 @@ mod tests {
             );
         }
 
-        // At omega = 85.0 and 144Hz (dt = 6.94ms), a 600px translation completes
-        // smoothly and critically damped in ~18-20 frames (~125ms).
+        // At omega = 35.0 and 144Hz (dt = 6.94ms), a 600px translation completes
+        // smoothly and critically damped in ~35-45 frames (~250-300ms).
         assert!(
-            frames <= 25,
+            frames <= 60,
             "Spring took too long to converge at 144Hz: {} frames",
             frames
         );
@@ -1370,10 +1403,10 @@ mod tests {
         }
 
         // Focus 5th window (index 4, hwnd 5)
-        // window_left = 4 * (960 + 16) = 3904
-        // center_x = 3904 + 480 = 4384
-        // target_offset_x = 4384 - 1920/2 = 3424
+        // window_left = 16 + 4 * (960 + 16) = 3920
+        // center_x = 3920 + 480 = 4400
+        // target_offset_x = 4400 - 1920/2 = 3440
         state.focus_window_offset(HWND(5 as *mut _));
-        assert_eq!(state.target_offset_x, 3424.0);
+        assert_eq!(state.target_offset_x, 3440.0);
     }
 }
