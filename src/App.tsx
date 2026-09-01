@@ -32,6 +32,7 @@ import { Badge } from "./components/ui/badge";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import { DebugOverlay } from "./components/DebugOverlay";
 import { LayoutPreview } from "./components/LayoutPreview";
+import { ProxyCardManager } from "./components/ProxyCardManager";
 import "./App.css";
 
 interface WmConfig {
@@ -800,6 +801,9 @@ export function App() {
 
       {/* Floating Debug Overlay */}
       {debugEnabled && <DebugOverlay onClose={() => setDebugEnabled(false)} />}
+
+      {/* Proxy Card Manager for hardware-accelerated MPO Games */}
+      <ProxyCardManager />
     </div>
   );
 }

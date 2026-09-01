@@ -8,6 +8,7 @@ use windows::Win32::Foundation::{HWND, RECT, E_ACCESSDENIED};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsWindowVisible, SetWindowPos,
     SWP_ASYNCWINDOWPOS, SWP_NOZORDER, SWP_NOACTIVATE,
+    GetClassNameW, GetWindowLongPtrW, GetWindowLongW, GWL_STYLE, WS_POPUP, WS_CAPTION, WS_THICKFRAME, WINDOW_STYLE,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DwmRegisterThumbnail, DwmUpdateThumbnailProperties, DwmUnregisterThumbnail,
@@ -25,11 +26,18 @@ fn isize_to_hwnd(ptr: isize) -> HWND {
 // System 1: The Asynchronous Shadow DOM (The Read Pipeline)
 // -----------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineType {
+    StandardApp, // Pipeline A: DWM Thumbnails
+    HeavyGame,   // Pipeline B: 1x1 Region Clipping
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowState {
     pub hwnd: isize,
     pub rect: RECT,
     pub is_visible: bool,
+    pub pipeline: PipelineType,
 }
 
 pub struct WindowStateCache {
@@ -62,7 +70,8 @@ impl WindowStateCache {
                     for hwnd_isize in hwnds {
                         let hwnd = isize_to_hwnd(hwnd_isize);
                         let mut rect = RECT::default();
-                        let mut is_visible;
+                        let is_visible;
+                        let mut pipeline = PipelineType::StandardApp;
                         
                         unsafe {
                             // Non-blocking getters. If a window is hung, these might block briefly, 
@@ -77,12 +86,43 @@ impl WindowStateCache {
                             }
                             
                             is_visible = IsWindowVisible(hwnd).into();
+
+                            if is_visible {
+                                // 1. Window Class Blocklist
+                                let mut class_name_buf = [0u16; 256];
+                                let len = GetClassNameW(hwnd, &mut class_name_buf);
+                                if len > 0 {
+                                    let class_name = String::from_utf16_lossy(&class_name_buf[..len as usize]);
+                                    let lower_class = class_name.to_lowercase();
+                                    let blocklist = ["unrealwindow", "unitywndclass", "sdl_app", "glfw30", "riotwindowclass"];
+                                    if blocklist.iter().any(|&b| lower_class.contains(b)) {
+                                        pipeline = PipelineType::HeavyGame;
+                                    }
+                                }
+
+                                // 2. Borderless Fullscreen Style Check
+                                if pipeline != PipelineType::HeavyGame {
+                                    #[cfg(target_pointer_width = "32")]
+                                    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+                                    #[cfg(target_pointer_width = "64")]
+                                    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+                                    
+                                    let ws_popup = WS_POPUP.0;
+                                    let ws_caption = WS_CAPTION.0;
+                                    let ws_thickframe = WS_THICKFRAME.0;
+
+                                    if (style & ws_popup) == ws_popup && (style & ws_caption) != ws_caption && (style & ws_thickframe) != ws_thickframe {
+                                        pipeline = PipelineType::HeavyGame;
+                                    }
+                                }
+                            }
                         }
                         
                         new_states.insert(hwnd_isize, WindowState {
                             hwnd: hwnd_isize,
                             rect,
                             is_visible,
+                            pipeline,
                         });
                     }
 
@@ -98,12 +138,6 @@ impl WindowStateCache {
 // -----------------------------------------------------------------------------
 // System 2: The Dual Movement Pipelines (The Write Pipeline)
 // -----------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineType {
-    StandardApp, // Pipeline A: DWM Thumbnails
-    HeavyGame,   // Pipeline B: 1x1 Region Clipping
-}
 
 #[derive(Debug, Clone)]
 pub enum MovementMsg {
@@ -371,13 +405,6 @@ impl WmMovementCoordinator {
         }
     }
 
-    // Heuristic categorization for the dual pipelines
-    fn categorize_window(&self, _hwnd: isize) -> PipelineType {
-        // TODO: Query window attributes or exe name to detect heavy MPO games (e.g. Valorant)
-        // Defaulting to StandardApp for normal applications.
-        PipelineType::StandardApp
-    }
-
     /// Triggered globally on a scroll/pan start
     pub fn begin_scroll(&self) {
         let states = {
@@ -390,7 +417,7 @@ impl WmMovementCoordinator {
 
         for (hwnd, state) in states {
             if state.is_visible {
-                let pipeline = self.categorize_window(hwnd);
+                let pipeline = state.pipeline;
                 self.worker.send(MovementMsg::Init {
                     hwnd,
                     pipeline,
